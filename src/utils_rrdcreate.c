@@ -210,7 +210,7 @@ static int ds_get (char ***ret, /* {{{ */
     ds_def[ds_num] = NULL;
 
     if (d->type == DS_TYPE_COUNTER)
-      type = "COUNTER";
+      type = "DERIVE";
     else if (d->type == DS_TYPE_GAUGE)
       type = "GAUGE";
     else
