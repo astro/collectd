@@ -39,6 +39,22 @@ function dhtml_response_list(&$items, $method) {
 	print("</response>");
 }
 
+function dhtml_response_graphs(&$graphs, $method) {
+	header("Content-Type: text/xml");
+
+	print('<?xml version="1.0" encoding="utf-8" ?>'."\n");
+	print("<response>\n");
+	printf(" <method>%s</method>\n", htmlspecialchars($method));
+	print(" <result>\n");
+	foreach ($graphs as &$graph)
+		printf('  <graph host="%s" plugin="%s" plugin_instance="%s" type="%s" type_instance="%s" timespan="%s" logarithmic="%d" tinyLegend="%d" />'."\n",
+		       htmlspecialchars($graph['host']), htmlspecialchars($graph['plugin']), htmlspecialchars($graph['pinst']),
+		       htmlspecialchars($graph['type']), htmlspecialchars($graph['tinst']), htmlspecialchars($graph['timespan']),
+		       htmlspecialchars($graph['logarithmic']), htmlspecialchars($graph['tinyLegend']));
+	print(" </result>\n");
+	print("</response>");
+}
+
 /**
  * Product page body with selection fields
  */
@@ -66,7 +82,7 @@ function build_page() {
 		<style type="text/css">
 			body, html { background-color: #EEEEEE; color: #000000; }
 			h1 { text-align: center; }
-			div.body { margin: auto; width: <?php echo isset($config['rrd_width']) ? 125+(int)$config['rrd_width'] : 600; ?>px; background: #FFFFFF; border: 1px solid #DDDDDD; }
+			div.body { margin: auto; width: <?php echo isset($config['rrd_width']) ? 110+(int)$config['rrd_width'] : 600; ?>px; background: #FFFFFF; border: 1px solid #DDDDDD; }
 			p.error { color: #CC0000; margin: 0em; }
 			div.selector { margin: 0.5em 2em; }
 			div.selectorbox { padding: 5px; border: 1px solid #CCCCCC; background-color: #F8F8F8; }
@@ -77,11 +93,12 @@ function build_page() {
 			div.selectorbox table td.sc { padding: 0.5em 2em; text-align: center; }
 			a img { border: none; }
 			div.graphs { border-top: 1px solid #DDDDDD; padding: 5px; overflow: auto; }
-			div.graphs_t { display: table; }
-			div.graph { display: table-row; }
-			div.graph_img { display: table-cell; vertical-align: middle; text-align: right; }
-			div.graph_opts { display: table-cell; vertical-align: middle; text-align: center; line-height: 2em; }
-			select { width: 100%; }
+			div.graphs_t { position: relative; }
+			div.graph { text-align: right; }
+			div.selector select { width: 100%; }
+			table.toolbox { border: 1px solid #5500dd; padding: 0px; margin: 0px; background: #ffffff;}
+			table.toolbox td.c1 { vertical-align: middle; text-align: left; padding-left: 0.3em; padding-right: 1em; border-right: 1px solid #5500dd; }
+			table.toolbox td.c2 { vertical-align: middle; text-align: center; padding-left: 5px; padding-right: 5px; }
 		</style>
 		<script type="text/javascript">// <![CDATA[
 var dhtml_url = '<?php echo addslashes($url_base.basename($_SERVER['PHP_SELF'])); ?>';
@@ -137,7 +154,7 @@ var graph_url = '<?php echo addslashes($url_base.'graph.php'); ?>';
 				<tr>
 					<td class="sc" colspan="3"><input id="btnAdd"     name="btnAdd"     type="button" disabled="disabled" onclick="GraphAppend()" value="Add graph" />
 					<input id="btnClear"   name="btnClear"   type="button" disabled="disabled" onclick="GraphDropAll()" value="Remove all graphs" />
-					<input id="btnRefresh" name="btnRefresh" type="button" disabled="disabled" onclick="GraphRefresh(null)" value="Refresh all graphs" /></td>
+					<input id="btnRefresh" name="btnRefresh" type="button" disabled="disabled" onclick="GraphRefreshAll()" value="Refresh all graphs" /></td>
 				</tr>
 				<tr>
 					<td class="s1" rowspan="2">Graph list favorites:</td>
@@ -193,6 +210,24 @@ var graph_url = '<?php echo addslashes($url_base.'graph.php'); ?>';
 				echo '<p class="error">Config error: RRDTOOL ('.htmlspecialchars(RRDTOOL).') is not executable</p>';
 			?></div>
 		</div></div>
+		<input type="hidden" name="ge_graphid" id="ge_graphid" value="" />
+		<table id="ge" class="toolbox" style="position: absolute; display: none; " cellspacing="1" cellpadding="0">
+			<tr>
+				<td class="c1" rowspan="3"><select id="ge_timespan" name="ge_timespan" onchange="GraphAdjust(null)"><?php
+				foreach ($config['timespan'] as &$timespan)
+					printf("\t\t\t\t\t\t<option value=\"%s\">%s</option>\n", htmlspecialchars($timespan['name']), htmlspecialchars($timespan['label']));
+				?></select><br />
+				<label><input id="ge_logarithmic"  name="ge_logarithmic" type="checkbox" value="1" onchange="GraphAdjust(null)" /> Logarithmic scale</label><br />
+				<label><input id="ge_tinylegend"  name="ge_tinylegend" type="checkbox" value="1" onchange="GraphAdjust(null)" /> Minimal legend</label></td>
+				<td class="c2"><a href="javascript:GraphMoveUp(null)"><img src="move-up.png" alt="UP" title="Move graph up"/></a></td>
+			</tr>
+			<tr>
+				<td class="c2"><a href="javascript:GraphRefresh(null)"><img src="refresh.png" alt="R" title="Refresh graph"/></a>&nbsp;<a href="javascript:GraphRemove(null)"><img src="delete.png" alt="RM" title="Remove graph"/></a></td>
+			</tr>
+			<tr>
+				<td class="c2"><a href="javascript:GraphMoveDown(null)"><img src="move-down.png" alt="DN" title="Move graph down"/></a></td>
+			</tr>
+		</table>
 	</div></body>
 </html><?php
 }
@@ -206,53 +241,86 @@ switch ($action) {
 	case 'list_hosts':
 		// Generate a list of hosts
 		$hosts = collectd_list_hosts();
+		if (count($hosts) > 1)
+			array_unshift($hosts, '@all');
 		return dhtml_response_list($hosts, 'ListOfHost');
 
 	case 'list_plugins':
 		// Generate list of plugins for selected hosts
-		$arg_hosts = read_var('host', $_POST, array());
-		if (!is_array($arg_hosts))
-			$arg_hosts = array($arg_hosts);
-		$plugins = collectd_list_plugins(reset($arg_hosts));
+		$arg_hosts = read_var('host', $_POST, '');
+		if (is_array($arg_hosts))
+			$arg_hosts = reset($arg_hosts);
+		$plugins = collectd_list_plugins($arg_hosts);
+		if (count($plugins) > 1)
+			array_unshift($plugins, '@all');
 		return dhtml_response_list($plugins, 'ListOfPlugin');
 
 	case 'list_pinsts':
 		// Generate list of plugin_instances for selected hosts and plugin
-		$arg_hosts = read_var('host', $_POST, array());
-		if (!is_array($arg_hosts))
-			$arg_hosts = array($arg_hosts);
+		$arg_hosts = read_var('host', $_POST, '');
+		if (is_array($arg_hosts))
+			$arg_hosts = reset($arg_hosts);
 		$arg_plugin = read_var('plugin', $_POST, '');
-		$pinsts = collectd_list_pinsts(reset($arg_hosts), $arg_plugin);
+		$pinsts = collectd_list_plugins($arg_hosts, $arg_plugin);
+		if (count($pinsts) > 1)
+			array_unshift($pinsts, '@all' /* , '@merge_sum', '@merge_avg', '@merge_stack', '@merge_line' */);
 		return dhtml_response_list($pinsts, 'ListOfPluginInstance');
 
 	case 'list_types':
 		// Generate list of types for selected hosts, plugin and plugin-instance
-		$arg_hosts  = read_var('host', $_POST, array());
-		if (!is_array($arg_hosts))
-			$arg_hosts = array($arg_hosts);
+		$arg_hosts  = read_var('host', $_POST, '');
+		if (is_array($arg_hosts))
+			$arg_hosts = reset($arg_hosts);
 		$arg_plugin = read_var('plugin', $_POST, '');
 		$arg_pinst  = read_var('plugin_instance', $_POST, '');
-		$types = collectd_list_types(reset($arg_hosts), $arg_plugin, $arg_pinst);
+		$types = collectd_list_types($arg_hosts, $arg_plugin, $arg_pinst);
+		if (count($types) > 1)
+			array_unshift($types, '@all');
 		return dhtml_response_list($types, 'ListOfType');
 
 	case 'list_tinsts':
 		// Generate list of types for selected hosts, plugin and plugin-instance
-		$arg_hosts  = read_var('host', $_POST, array());
-		if (!is_array($arg_hosts))
-			$arg_hosts = array($arg_hosts);
+		$arg_hosts  = read_var('host', $_POST, '');
+		if (is_array($arg_hosts))
+			$arg_hosts = reset($arg_hosts);
 		$arg_plugin = read_var('plugin', $_POST, '');
 		$arg_pinst  = read_var('plugin_instance', $_POST, '');
 		$arg_type   = read_var('type', $_POST, '');
-		$tinsts = collectd_list_tinsts(reset($arg_hosts), $arg_plugin, $arg_pinst, $arg_type);
-		if (count($tinsts)) {
-			require('definitions.php');
-			load_graph_definitions();
-			if (isset($MetaGraphDefs[$arg_type])) {
-				$meta_tinsts = array('@');
-				return dhtml_response_list($meta_tinsts, 'ListOfTypeInstance');
+		$tinsts = collectd_list_types($arg_hosts, $arg_plugin, $arg_pinst, $arg_type);
+		if (count($tinsts))
+			if ($arg_type != '@all') {
+				require('definitions.php');
+				load_graph_definitions();
+				if (isset($MetaGraphDefs[$arg_type]))
+					array_unshift($tinsts, '@merge');
+				if (count($tinsts) > 1)
+					array_unshift($tinsts, '@all');
+			} else {
+				array_unshift($tinsts, /* '@merge_sum', '@merge_avg', '@merge_stack', '@merge_line', */ '@merge');
+				if (count($tinsts) > 1)
+					array_unshift($tinsts, '@all');
 			}
-		}
 		return dhtml_response_list($tinsts, 'ListOfTypeInstance');
+
+	case 'list_graphs':
+		// Generate list of types for selected hosts, plugin and plugin-instance
+		$arg_hosts  = read_var('host', $_POST, '');
+		if (is_array($arg_hosts))
+			$arg_hosts = reset($arg_hosts);
+		$arg_plugin = read_var('plugin', $_POST, '');
+		$arg_pinst  = read_var('plugin_instance', $_POST, '');
+		$arg_type   = read_var('type', $_POST, '');
+		$arg_tinst  = read_var('type_instance', $_POST, '');
+		$arg_log    = (int)read_var('logarithmic', $_POST, '0');
+		$arg_legend = (int)read_var('tinyLegend', $_POST, '0');
+		$arg_period = read_var('timespan', $_POST, '');
+		$graphs = collectd_list_graphs($arg_hosts, $arg_plugin, $arg_pinst, $arg_type, $arg_tinst);
+		foreach ($graphs as &$graph) {
+			$graph['logarithmic'] = $arg_log;
+			$graph['tinyLegend']  = $arg_legend;
+			$graph['timespan']    = $arg_period;
+		}
+		return dhtml_response_graphs($graphs, 'ListOfGraph');
 
 	case 'overview':
 	default:

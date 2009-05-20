@@ -40,6 +40,9 @@ Features
       Name server and resolver statistics from the `statistics-channel'
       interface of BIND 9.5, 9,6 and later.
 
+    - conntrack
+      Number of nf_conntrack entries.
+
     - cpu
       CPU utilization: Time spent in the system, user, nice, idle, and related
       states.
@@ -76,6 +79,12 @@ Features
     - filecount
       Count the number of files in directories.
 
+    - fscache
+      Linux file-system based caching framework statistics.
+
+    - gmond
+      Receive multicast traffic from Ganglia instances.
+
     - hddtemp
       Harddisk temperatures using hddtempd.
 
@@ -98,6 +107,10 @@ Features
     - irq
       IRQ counters: Frequency in which certain interrupts occur.
 
+    - java
+      Integrates a `Java Virtual Machine' (JVM) to execute plugins in Java
+      bytecode. See “Configuring with libjvm” below.
+
     - load
       System load average over the last 1, 5 and 15 minutes.
 
@@ -107,6 +120,9 @@ Features
     - mbmon
       Motherboard sensors: temperature, fanspeed and voltage information,
       using mbmon(1).
+
+    - memcachec
+      Query and parse data from a memcache daemon (memcached).
 
     - memcached
       Statistics of the memcached distributed caching system.
@@ -179,6 +195,9 @@ Features
     - processes
       Process counts: Number of running, sleeping, zombie, ... processes.
 
+    - protocols
+      Counts various aspects of network protocols such as IP, TCP, UDP, etc.
+
     - rrdcached
       RRDtool caching daemon (RRDcacheD) statistics.
 
@@ -197,6 +216,9 @@ Features
     - swap
       Pages swapped out onto harddisk or whatever is called `swap' by the OS..
 
+    - table
+      Parse table-like structured files.
+
     - tail
       Follows (tails) logfiles, parses them by lines and submits matched
       values.
@@ -210,8 +232,14 @@ Features
     - teamspeak2
       TeamSpeak2 server statistics.
 
+    - ted
+      Plugin to read values from `The Energy Detective' (TED).
+
     - thermal
       Linux ACPI thermal zone information.
+
+    - uptime
+      System uptime statistics.
 
     - users
       Users currently logged in.
@@ -415,6 +443,12 @@ Prerequisites
     For the `notify_email' plugin.
     <http://www.stafford.uklinux.net/libesmtp/>
 
+  * libganglia (optional)
+    Used by the `gmond' plugin to process data received from Ganglia.
+
+  * libgcrypt (optional)
+    Used by the `network' plugin for encryption and authentication.
+
   * libhal (optional)
     If present, the uuid plugin will check for UUID from HAL.
     <http://hal.freedesktop.org/>
@@ -423,6 +457,14 @@ Prerequisites
     can be used if the Linux kernel headers are available)
     For querying iptables counters.
     <http://netfilter.org/>
+
+  * libjvm (optional)
+    Library that encapsulates the `Java Virtual Machine' (JVM). This library is
+    used by the Java plugin to execute Java bytecode. See “Configuring with
+    libjvm” below.
+
+  * libmemcached (optional)
+    Used by the `memcachec' plugin to connect to a memcache daemon.
 
   * libmysqlclient (optional)
     Unsurprisingly used by the `mysql' plugin.
@@ -511,10 +553,16 @@ Configuring / Compiling / Installing
   will be enabled). To enable a plugin, install missing dependencies (see
   section `Prerequisites' above) and rerun `configure'. If you specify the
   `--enable-<plugin>' configure option, the script will fail if the depen-
-  dencies for the specified plugin are not met. If you specify the
-  `--disable-<plugin>' configure option, the plugin will not be built. Both
-  options are meant for package maintainers and should not be used in everyday
-  situations.
+  dencies for the specified plugin are not met. In that case you can force the
+  plugin to be built using the `--enable-<plugin>=force' configure option.
+  This will most likely fail though unless you're working in a very unusual
+  setup and you really know what you're doing. If you specify the
+  `--disable-<plugin>' configure option, the plugin will not be built. If you
+  specify the `--enable-all-plugins' or `--disable-all-plugins' configure
+  options, all plugins will be enabled or disabled respectively by default.
+  Explicitly enabling or disabling a plugin overwrites the default for the
+  specified plugin. These options are meant for package maintainers and should
+  not be used in everyday situations.
 
   By default, collectd will be installed into `/opt/collectd'. You can adjust
   this setting by specifying the `--prefix' configure option - see INSTALL for
@@ -522,6 +570,42 @@ Configuring / Compiling / Installing
   prefixed to all installation directories. This might be useful when creating
   packages for collectd.
 
+Configuring with libjvm
+-----------------------
+
+  To determine the location of the required files of a Java installation is not
+  an easy task, because the locations vary with your kernel (Linux, SunOS, …)
+  and with your architecture (x86, SPARC, …) and there is no ‘java-config’
+  script we could use. Configuration of the JVM library is therefore a bit
+  tricky.
+
+  The easiest way to use the `--with-java=$JAVA_HOME' option, where
+  `$JAVA_HOME' is usually something like:
+    /usr/lib/jvm/java-1.5.0-sun-1.5.0.14
+
+  The configure script will then use find(1) to look for the following files:
+
+    - jni.h
+    - jni_md.h
+    - libjvm.so
+
+  If found, appropriate CPP-flags and LD-flags are set and the following
+  library checks succeed.
+
+  If this doesn't work for you, you have the possibility to specify CPP-flags,
+  C-flags and LD-flags for the ‘Java’ plugin by hand, using the following three
+  (environment) variables:
+
+    - JAVA_CPPFLAGS
+    - JAVA_CFLAGS
+    - JAVA_LDFLAGS
+
+  For example (shortened for demonstration purposes):
+
+    ./configure JAVA_CPPFLAGS="-I$JAVA_HOME/include -I$JAVA_HOME/include/linux"
+
+  Adding "-ljvm" to the JAVA_LDFLAGS is done automatically, you don't have to
+  do that.
 
 Crosscompiling
 --------------

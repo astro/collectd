@@ -665,7 +665,7 @@ separated by dashes I<("-")>.
 
 Specifies the columns whose values will be used to create the "type-instance"
 for each row. If you specify more than one column, the value of all columns
-will be join together with the dashes I<("-")> as separation character.
+will be joined together with dashes I<("-")> as separation characters.
 
 The plugin itself does not check whether or not all built instances are
 different. It's your responsibility to assure that each is unique. This is
@@ -962,6 +962,88 @@ Controls whether or not to recurse into subdirectories. Enabled by default.
 
 =back
 
+=head2 Plugin C<gmond>
+
+The I<gmond> plugin received the multicast traffic sent by B<gmond>, the
+statistics collection daemon of Ganglia. Mappings for the standard "metrics"
+are built-in, custom mappings may be added via B<Metric> blocks, see below.
+
+Synopsis:
+
+ <Plugin "gmond">
+   MCReceiveFrom "239.2.11.71" "8649"
+   <Metric "swap_total">
+     Type "swap"
+     TypeInstance "total"
+     DataSource "value"
+   </Metric>
+   <Metric "swap_free">
+     Type "swap"
+     TypeInstance "free"
+     DataSource "value"
+   </Metric>
+ </Plugin>
+
+The following metrics are built-in:
+
+=over 4
+
+=item *
+
+load_one, load_five, load_fifteen
+
+=item *
+
+cpu_user, cpu_system, cpu_idle, cpu_nice, cpu_wio
+
+=item *
+
+mem_free, mem_shared, mem_buffers, mem_cached, mem_total
+
+=item *
+
+bytes_in, bytes_out
+
+=item *
+
+pkts_in, pkts_out
+
+=back
+
+Available configuration options:
+
+=over 4
+
+=item B<MCReceiveFrom> I<MCGroup> [I<Port>]
+
+Sets sets the multicast group and UDP port to which to subscribe.
+
+Default: B<239.2.11.71>E<nbsp>/E<nbsp>B<8649>
+
+=item E<lt>B<Metric> I<Name>E<gt>
+
+These blocks add a new metric conversion to the internal table. I<Name>, the
+string argument to the B<Metric> block, is the metric name as used by Ganglia.
+
+=over 4
+
+=item B<Type> I<Type>
+
+Type to map this metric to. Required.
+
+=item B<TypeInstance> I<Instance>
+
+Type-instance to use. Optional.
+
+=item B<DataSource> I<Name>
+
+Data source to map this metric to. If the configured type has exactly one data
+source, this is optional. Otherwise the option is required.
+
+=back
+
+=back
+
 =head2 Plugin C<hddtemp>
 
 To get values from B<hddtemp> collectd connects to B<localhost> (127.0.0.1),
@@ -1083,6 +1165,62 @@ Sometimes, however, it's easier/preferred to collect all interrupts I<except> a
 few ones. This option enables you to do that: By setting B<IgnoreSelected> to
 I<true> the effect of B<Irq> is inverted: All selected interrupts are ignored
 and all other interrupts are collected.
+
+=back
+
+=head2 Plugin C<java>
+
+The I<Java> plugin makes it possible to write extensions for collectd in Java.
+This section only discusses the syntax and semantic of the configuration
+options. For more in-depth information on the I<Java> plugin, please read
+L<collectd-java(5)>.
+
+Synopsis:
+
+ <Plugin "java">
+   JVMArg "-verbose:jni"
+   JVMArg "-Djava.class.path=/opt/collectd/lib/collectd/bindings/java"
+   LoadPlugin "org.collectd.java.Foobar"
+   <Plugin "org.collectd.java.Foobar">
+     # To be parsed by the plugin
+   </Plugin>
+ </Plugin>
+
+Available configuration options:
+
+=over 4
+
+=item B<JVMArg> I<Argument>
+
+Argument that is to be passed to the I<Java Virtual Machine> (JVM). This works
+exactly the way the arguments to the I<java> binary on the command line work.
+Execute C<javaE<nbsp>--help> for details.
+
+Please note that B<all> these options must appear B<before> (i.E<nbsp>e. above)
+any other options! When another option is found, the JVM will be started and
+later options will have to be ignored!
+
+=item B<LoadPlugin> I<JavaClass>
+
+Instantiates a new I<JavaClass> object. The constructor of this object very
+likely then registers one or more callback methods with the server.
+
+See L<collectd-java(5)> for details.
+
+When the first such option is found, the virtual machine (JVM) is created. This
+means that all B<JVMArg> options must appear before (i.E<nbsp>e. above) all
+B<LoadPlugin> options!
+
+=item B<Plugin> I<Name>
+
+The entire block is passed to the Java plugin as an
+I<org.collectd.api.OConfigItem> object.
+
+For this to work, the plugin has to register a configuration callback first,
+see L<collectd-java(5)/"config callback">. This means, that the B<Plugin> block
+must appear after the appropriate B<LoadPlugin> block. Also note, that I<Name>
+depends on the (Java) plugin registering the callback and is completely
+independent from the I<JavaClass> argument passed to B<LoadPlugin>.
 
 =back
 
@@ -1217,6 +1355,57 @@ TCP-Port to connect to. Defaults to B<411>.
 
 =back
 
+=head2 Plugin C<memcachec>
+
+The C<memcachec plugin> connects to a memcached server, queries one or more
+given I<pages> and parses the returned data according to user specification.
+The I<matches> used are the same as the matches used in the C<curl> and C<tail>
+plugins.
+
+In order to talk to the memcached server, this plugin uses the I<libmemcached>
+library. Please note that there is another library with a very similar name,
+libmemcache (notice the missing `d'), which is not applicable.
+
+Synopsis of the configuration:
+
+ <Plugin "memcachec">
+   <Page "plugin_instance">
+     Server "localhost"
+     Key "page_key"
+     <Match>
+       Regex "(\\d+) bytes sent"
+       DSType CounterAdd
+       Type "ipt_octets"
+       Instance "type_instance"
+     </Match>
+   </Page>
+ </Plugin>
+
+The configuration options are:
+
+=over 4
+
+=item E<lt>B<Page> I<Name>E<gt>
+
+Each B<Page> block defines one I<page> to be queried from the memcached server.
+The block requires one string argument which is used as I<plugin instance>.
+
+=item B<Server> I<Address>
+
+Sets the server address to connect to when querying the page. Must be inside a
+B<Page> block.
+
+=item B<Key> I<Key>
+
+When connected to the memcached server, asks for the page I<Key>.
+
+=item E<lt>B<Match>E<gt>
+
+Match blocks define which strings to look for and how matches substrings are
+interpreted. For a description of match blocks, please see L<"Plugin tail">.
+
+=back
+
 =head2 Plugin C<memcached>
 
 The C<memcached plugin> connects to a memcached server and queries statistics
@@ -1237,19 +1426,50 @@ TCP-Port to connect to. Defaults to B<11211>.
 
 =head2 Plugin C<mysql>
 
-The C<mysql plugin> requires B<mysqlclient> to be installed. It connects to the
-database when started and keeps the connection up as long as possible. When the
-connection is interrupted for whatever reason it will try to re-connect. The
-plugin will complaint loudly in case anything goes wrong.
+The C<mysql plugin> requires B<mysqlclient> to be installed. It connects to
+one or more databases when started and keeps the connection up as long as
+possible. When the connection is interrupted for whatever reason it will try
+to re-connect. The plugin will complaint loudly in case anything goes wrong.
 
-This plugin issues the MySQL C<SHOW STATUS> command and collects information
-about MySQL network traffic, executed statements, requests, the query cache
-and threads by evaluating the C<Bytes_{received,sent}>, C<Com_*>,
-C<Handler_*>, C<Qcache_*> and C<Threads_*> return values. Please refer to the
-B<MySQL reference manual>, I<5.1.6. Server Status Variables> for an
-explanation of these values.
+This plugin issues the MySQL C<SHOW STATUS> / C<SHOW GLOBAL STATUS> command
+and collects information about MySQL network traffic, executed statements,
+requests, the query cache and threads by evaluating the
+C<Bytes_{received,sent}>, C<Com_*>, C<Handler_*>, C<Qcache_*> and C<Threads_*>
+return values. Please refer to the B<MySQL reference manual>, I<5.1.6. Server
+Status Variables> for an explanation of these values.
 
-Use the following options to configure the plugin:
+Optionally, master and slave statistics may be collected in a MySQL
+replication setup. In that case, information about the synchronization state
+of the nodes are collected by evaluating the C<Position> return value of the
+C<SHOW MASTER STATUS> command and the C<Seconds_Behind_Master>,
+C<Read_Master_Log_Pos> and C<Exec_Master_Log_Pos> return values of the
+C<SHOW SLAVE STATUS> command. See the B<MySQL reference manual>,
+I<12.5.5.21 SHOW MASTER STATUS Syntax> and
+I<12.5.5.31 SHOW SLAVE STATUS Syntax> for details.
+
+Synopsis:
+
+  <Plugin mysql>
+    <Database foo>
+      Host "hostname"
+      User "username"
+      Password "password"
+      Port "3306"
+      MasterStats true
+    </Database>
+
+    <Database bar>
+      Host "localhost"
+      Socket "/var/run/mysql/mysqld.sock"
+      SlaveStats true
+      SlaveNotifications true
+    </Database>
+  </Plugin>
+
+A B<Database> block defines one connection to a MySQL database. It accepts a
+single argument which specifies the name of the database. None of the other
+options are required. MySQL will use default values as documented in the
+section "mysql_real_connect()" in the B<MySQL reference manual>.
 
 =over 4
 
@@ -1288,6 +1508,17 @@ Specifies the path to the UNIX domain socket of the MySQL server. This option
 only has any effect, if B<Host> is set to B<localhost> (the default).
 Otherwise, use the B<Port> option above. See the documentation for the
 C<mysql_real_connect> function for details.
+
+=item B<MasterStats> I<true|false>
+
+=item B<SlaveStats> I<true|false>
+
+Enable the collection of master / slave statistics in a replication setup.
+
+=item B<SlaveNotifications> I<true|false>
+
+If enabled, the plugin sends a notification if the replication slave I/O and /
+or SQL threads are not running.
 
 =back
 
@@ -1370,32 +1601,119 @@ specified statistics will not be collected.
 
 =head2 Plugin C<network>
 
+The Network plugin sends data to a remote instance of collectd, receives data
+from a remote instance, or both at the same time. Data which has been received
+from the network is usually not transmitted again, but this can be actived, see
+the B<Forward> option below.
+
+The default IPv6 multicast group is C<ff18::efc0:4a42>. The default IPv4
+multicast group is C<239.192.74.66>. The default I<UDP> port is B<25826>.
+
+Both, B<Server> and B<Listen> can be used as single option or as block. When
+used as block, given options are valid for this socket only. For example:
+
+ <Plugin "network">
+   Server "collectd.internal.tld"
+   <Server "collectd.external.tld">
+     SecurityLevel "sign"
+     Username "myhostname"
+     Password "ohl0eQue"
+   </Server>
+ </Plugin>
+
 =over 4
 
-=item B<Listen> I<Host> [I<Port>]
+=item B<E<lt>Server> I<Host> [I<Port>]B<E<gt>>
 
-=item B<Server> I<Host> [I<Port>]
+The B<Server> statement/block sets the server to send datagrams to. The
+statement may occur multiple times to send each datagram to multiple
+destinations.
 
-The B<Server> statement sets the server to send datagrams B<to>.  The statement
-may occur multiple times to send each datagram to multiple destinations.
+The argument I<Host> may be a hostname, an IPv4 address or an IPv6 address. The
+optional second argument specifies a port number or a service name. If not
+given, the default, B<25826>, is used.
+
+The following options are recognized within B<Server> blocks:
+
+=over 4
+
+=item B<SecurityLevel> B<Encrypt>|B<Sign>|B<None>
+
+Set the security you require for network communication. When the security level
+has been set to B<Encrypt>, data sent over the network will be encrypted using
+I<AES-256>. The integrity of encrypted packets is ensured using I<SHA-1>. When
+set to B<Sign>, transmitted data is signed using the I<HMAC-SHA-256> message
+authentication code. When set to B<None>, data is sent without any security.
+
+This feature is only available if the I<network> plugin was linked with
+I<libgcrypt>.
+
+=item B<Username> I<Username>
+
+Sets the username to transmit. This is used by the server to lookup the
+password. See B<AuthFile> below. All security levels except B<None> require
+this setting.
+
+This feature is only available if the I<network> plugin was linked with
+I<libgcrypt>.
+
+=item B<Password> I<Password>
+
+Sets a password (shared secret) for this socket. All security levels except
+B<None> require this setting.
+
+This feature is only available if the I<network> plugin was linked with
+I<libgcrypt>.
+
+=back
+
+=item B<E<lt>Listen> I<Host> [I<Port>]B<E<gt>>
 
 The B<Listen> statement sets the interfaces to bind to. When multiple
 statements are found the daemon will bind to multiple interfaces.
 
 The argument I<Host> may be a hostname, an IPv4 address or an IPv6 address. If
 the argument is a multicast address the daemon will join that multicast group.
+The optional second argument specifies a port number or a service name. If not
+given, the default, B<25826>, is used.
 
-If no B<Listen> statement is found the server tries join both, the default IPv6
-multicast group and the default IPv4 multicast group. If no B<Server> statement
-is found the client will try to send data to the IPv6 multicast group first. If
-that fails the client will try the IPv4 multicast group.
+The following options are recognized within C<E<lt>ListenE<gt>> blocks:
 
-The default IPv6 multicast group is C<ff18::efc0:4a42>. The default IPv4
-multicast group is C<239.192.74.66>.
+=over 4
 
-The optional I<Port> argument sets the port to use. It can either be given
-using a numeric port number or a service name. If the argument is omitted the
-default port B<25826> is assumed.
+=item B<SecurityLevel> B<Encrypt>|B<Sign>|B<None>
+
+Set the security you require for network communication. When the security level
+has been set to B<Encrypt>, only encrypted data will be accepted. The integrity
+of encrypted packets is ensured using I<SHA-1>. When set to B<Sign>, only
+signed and encrypted data is accepted. When set to B<None>, all data will be
+accepted. If an B<AuthFile> option was given (see below), encrypted data is
+decrypted if possible.
+
+This feature is only available if the I<network> plugin was linked with
+I<libgcrypt>.
+
+=item B<AuthFile> I<Filename>
+
+Sets a file in which usernames are mapped to passwords. These passwords are
+used to verify signatures and to decrypt encrypted network packets. If
+B<SecurityLevel> is set to B<None>, this is optional. If given, signed data is
+verified and encrypted packets are decrypted. Otherwise, signed data is
+accepted without checking the signature and encrypted data cannot be decrypted.
+For the other security levels this option is mandatory.
+
+The file format is very simple: Each line consists of a username followed by a
+colon and any number of spaces followed by the password. To demonstrate, an
+example file could look like this:
+
+  user0: foo
+  user1: bar
+
+Each time a packet is received, the modification time of the file is checked
+using L<stat(2)>. If the file has been changed, the contents is re-read. While
+the file is being read, it is locked using L<fcntl(2)>.
+
+=back
 
 =item B<TimeToLive> I<1-255>
 
@@ -1633,6 +1951,11 @@ enables you to do that: By setting B<IgnoreSelected> to I<true> the effect of
 B<Sensor> is inverted: All selected interfaces are ignored and all other
 interfaces are collected.
 
+=item B<Interval> I<Seconds>
+
+Sets the interval in which all sensors should be read. If not specified, the
+global B<Interval> setting is used.
+
 =back
 
 B<EXPERIMENTAL!> The C<onewire> plugin is experimental, because it doesn't yet
@@ -1741,12 +2064,39 @@ to collectd's plugin system. See L<collectd-perl(5)> for its documentation.
 
 =head2 Plugin C<ping>
 
+The I<Ping> plugin starts a new thread which sends ICMP "ping" packets to the
+configured hosts periodically and measures the network latency. Whenever the
+C<read> function of the plugin is called, it submits the average latency, the
+standard deviation and the drop rate for each host.
+
+Available configuration options:
+
 =over 4
 
 =item B<Host> I<IP-address>
 
 Host to ping periodically. This option may be repeated several times to ping
 multiple hosts.
+
+=item B<Interval> I<Seconds>
+
+Sets the interval in which to send ICMP echo packets to the configured hosts.
+This is B<not> the interval in which statistics are queries from the plugin but
+the interval in which the hosts are "pinged". Therefore, the setting here
+should be smaller than or equal to the global B<Interval> setting. Fractional
+times, such as "1.24" are allowed.
+
+Default: B<1.0>
+
+=item B<Timeout> I<Seconds>
+
+Time to wait for a response from the host to which an ICMP packet had been
+sent. If a reply was not received after I<Seconds> seconds, the host is assumed
+to be down or the packet to be dropped. This setting must be smaller than the
+B<Interval> setting above for the plugin to work correctly. Fractional
+arguments are accepted.
+
+Default: B<0.9>
 
 =item B<TTL> I<0-255>
 
@@ -2234,6 +2584,39 @@ slashes.
 
 =back
 
+=head2 Plugin C<protocols>
+
+Collects a lot of information about various network protocols, such as I<IP>,
+I<TCP>, I<UDP>, etc.
+
+Available configuration options:
+
+=over 4
+
+=item B<Value> I<Selector>
+
+Selects whether or not to select a specific value. The string being matched is
+of the form "I<Protocol>:I<ValueName>", where I<Protocol> will be used as the
+plugin instance and I<ValueName> will be used as type instance. An example of
+the string being used would be C<Tcp:RetransSegs>.
+
+You can use regular expressions to match a large number of values with just one
+configuration option. To select all "extended" I<TCP> values, you could use the
+following statement:
+
+  Value "/^TcpExt:/"
+
+Whether only matched values are selected or all matched values are ignored
+depends on the B<IgnoreSelected>. By default, only matched values are selected.
+If no value is configured at all, all values will be selected.
+
+=item B<IgnoreSelected> B<true>|B<false>
+
+If set to B<true>, inverts the selection made by B<Value>, i.E<nbsp>e. all
+matching values will be ignored.
+
+=back
+
 =head2 Plugin C<rrdcached>
 
 The C<rrdcached> plugin uses the RRDTool accelerator daemon, L<rrdcached(1)>,
@@ -2439,9 +2822,109 @@ debugging support.
 
 =back
 
+=head2 Plugin C<table>
+
+The C<table plugin> provides generic means to parse tabular data and dispatch
+user specified values. Values are selected based on column numbers. For
+example, this plugin may be used to get values from the Linux L<proc(5)>
+filesystem or CSV (comma separated values) files.
+
+  <Plugin table>
+    <Table "/proc/slabinfo">
+      Instance "slabinfo"
+      Separator " "
+      <Result>
+        Type gauge
+        InstancePrefix "active_objs"
+        InstancesFrom 0
+        ValuesFrom 1
+      </Result>
+      <Result>
+        Type gauge
+        InstancePrefix "objperslab"
+        InstancesFrom 0
+        ValuesFrom 4
+      </Result>
+    </Table>
+  </Plugin>
+
+The configuration consists of one or more B<Table> blocks, each of which
+configures one file to parse. Within each B<Table> block, there are one or
+more B<Result> blocks, which configure which data to select and how to
+interpret it.
+
+The following options are available inside a B<Table> block:
+
+=over 4
+
+=item B<Instance> I<instance>
+
+If specified, I<instance> is used as the plugin instance. So, in the above
+example, the plugin name C<table-slabinfo> would be used. If omitted, the
+filename of the table is used instead, with all special characters replaced
+with an underscore (C<_>).
+
+=item B<Separator> I<string>
+
+Any character of I<string> is interpreted as a delimiter between the different
+columns of the table. A sequence of two or more contiguous delimiters in the
+table is considered to be a single delimiter, i.E<nbsp>e. there cannot be any
+empty columns. The plugin uses the L<strtok_r(3)> function to parse the lines
+of a table - see its documentation for more details. This option is mandatory.
+
+A horizontal tab, newline and carriage return may be specified by C<\\t>,
+C<\\n> and C<\\r> respectively. Please note that the double backslashes are
+required because of collectd's config parsing.
+
+=back
+
+The following options are available inside a B<Result> block:
+
+=over 4
+
+=item B<Type> I<type>
+
+Sets the type used to dispatch the values to the daemon. Detailed information
+about types and their configuration can be found in L<types.db(5)>. This
+option is mandatory.
+
+=item B<InstancePrefix> I<prefix>
+
+If specified, prepend I<prefix> to the type instance. If omitted, only the
+B<InstancesFrom> option is considered for the type instance.
+
+=item B<InstancesFrom> I<column0> [I<column1> ...]
+
+If specified, the content of the given columns (identified by the column
+number starting at zero) will be used to create the type instance for each
+row. Multiple values (and the instance prefix) will be joined together with
+dashes (I<->) as separation character. If omitted, only the B<InstancePrefix>
+option is considered for the type instance.
+
+The plugin itself does not check whether or not all built instances are
+different. It’s your responsibility to assure that each is unique. This is
+especially true, if you do not specify B<InstancesFrom>: B<You> have to make
+sure that the table only contains one row.
+
+If neither B<InstancePrefix> nor B<InstancesFrom> is given, the type instance
+will be empty.
+
+=item B<ValuesFrom> I<column0> [I<column1> ...]
+
+Specifies the columns (identified by the column numbers starting at zero)
+whose content is used as the actual data for the data sets that are dispatched
+to the daemon. How many such columns you need is determined by the B<Type>
+setting above. If you specify too many or not enough columns, the plugin will
+complain about that and no data will be submitted to the daemon. The plugin
+uses L<strtoll(3)> and L<strtod(3)> to parse counter and gauge values
+respectively, so anything supported by those functions is supported by the
+plugin as well. This option is mandatory.
+
+=back
+
 =head2 Plugin C<tail>
 
-The C<tail plugin> plugins follows logfiles, just like L<tail(1)> does, parses
+The C<tail plugin> follows logfiles, just like L<tail(1)> does, parses
 each line and dispatches found values. What is matched can be configured by the
 user using (extended) regular expressions, as described in L<regex(7)>.
 
@@ -2575,6 +3058,37 @@ option would look like:
 This option, although numeric, needs to be a string, i.E<nbsp>e. you B<must>
 use quotes around it! If no such statement is given only global information
 will be collected.
+
+=back
+
+=head2 Plugin C<ted>
+
+The I<TED> plugin connects to a device of "The Energy Detective", a device to
+measure power consumption. These devices are usually connected to a serial
+(RS232) or USB port. The plugin opens a configured device and tries to read the
+current energy readings. For more information on TED, visit
+L<http://www.theenergydetective.com/>.
+
+Available configuration options:
+
+=over 4
+
+=item B<Device> I<Path>
+
+Path to the device on which TED is connected. collectd will need read and write
+permissions on that file.
+
+Default: B</dev/ttyUSB0>
+
+=item B<Retries> I<Num>
+
+Apparently reading from TED is not that reliable. You can therefore configure a
+number of retries here. You only configure the I<retries> here, to if you
+specify zero, one reading will be performed (but no retries if that fails); if
+you specify three, a maximum of four readings are performed. Negative values
+are illegal.
+
+Default: B<0>
 
 =back
 

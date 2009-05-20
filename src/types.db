@@ -9,6 +9,7 @@ cache_size		value:GAUGE:0:4294967295
 charge			value:GAUGE:0:U
 compression_ratio	value:GAUGE:0:2
 connections		value:COUNTER:0:U
+conntrack		entropy:GAUGE:0:4294967295
 counter			value:COUNTER:U:U
 cpufreq			value:GAUGE:0:U
 cpu			value:COUNTER:0:4294967295
@@ -69,10 +70,13 @@ memory			value:GAUGE:0:281474976710656
 multimeter		value:GAUGE:U:U
 mysql_commands		value:COUNTER:0:U
 mysql_handler		value:COUNTER:0:U
+mysql_locks		value:COUNTER:0:U
+mysql_log_position	value:COUNTER:0:4294967295
 mysql_octets		rx:COUNTER:0:4294967295, tx:COUNTER:0:4294967295
 mysql_qcache		hits:COUNTER:0:U, inserts:COUNTER:0:U, not_cached:COUNTER:0:U, lowmem_prunes:COUNTER:0:U, queries_in_cache:GAUGE:0:U
 mysql_threads		running:GAUGE:0:U, connected:GAUGE:0:U, cached:GAUGE:0:U, created:COUNTER:0:U
 nfs_procedure		value:COUNTER:0:4294967295
+fscache_stat		value:COUNTER:0:4294967295
 nginx_connections	value:GAUGE:0:U
 nginx_requests		value:COUNTER:0:134217728
 operations		value:COUNTER:0:4294967295
@@ -85,8 +89,11 @@ pg_numbackends		value:GAUGE:0:U
 pg_scan			value:COUNTER:0:U
 pg_xact			value:COUNTER:0:U
 ping			ping:GAUGE:0:65535
+ping_droprate		value:GAUGE:0:100
+ping_stddev		value:GAUGE:0:65535
 players			value:GAUGE:0:1000000
 power			value:GAUGE:0:U
+protocol_counter	value:COUNTER:0:U
 ps_count		processes:GAUGE:0:1000000, threads:GAUGE:0:1000000
 ps_cputime		user:COUNTER:0:16000000, syst:COUNTER:0:16000000
 ps_pagefaults		minflt:COUNTER:0:9223372036854775807, majflt:COUNTER:0:9223372036854775807
@@ -107,6 +114,7 @@ temperature		value:GAUGE:-273.15:U
 time_dispersion		seconds:GAUGE:-1000000:1000000
 timeleft		timeleft:GAUGE:0:3600
 time_offset		seconds:GAUGE:-1000000:1000000
+uptime			value:GAUGE:0:4294967295
 users			users:GAUGE:0:65535
 virt_cpu_total		ns:COUNTER:0:256000000000
 virt_vcpu		ns:COUNTER:0:1000000000

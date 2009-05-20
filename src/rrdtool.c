@@ -111,7 +111,8 @@ static rrd_queue_t    *queue_head = NULL;
 static rrd_queue_t    *queue_tail = NULL;
 static rrd_queue_t    *flushq_head = NULL;
 static rrd_queue_t    *flushq_tail = NULL;
-static pthread_t       queue_thread = 0;
+static pthread_t       queue_thread;
+static int             queue_thread_running = 1;
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  queue_cond = PTHREAD_COND_INITIALIZER;
 
@@ -282,6 +283,9 @@ static void *rrd_queue_thread (void __attribute__((unused)) *data)
 		int    status;
 		int    i;
 
+		values = NULL;
+		values_num = 0;
+
                 pthread_mutex_lock (&queue_lock);
                 /* Wait for values to arrive */
                 while (true)
@@ -400,8 +404,9 @@ static void *rrd_queue_thread (void __attribute__((unused)) *data)
 		/* Write the values to the RRD-file */
 		srrd_update (queue_entry->filename, NULL,
 				values_num, (const char **)values);
-		DEBUG ("rrdtool plugin: queue thread: Wrote %i values to %s",
-				values_num, queue_entry->filename);
+		DEBUG ("rrdtool plugin: queue thread: Wrote %i value%s to %s",
+				values_num, (values_num == 1) ? "" : "s",
+				queue_entry->filename);
 
 		for (i = 0; i < values_num; i++)
 		{
@@ -766,7 +771,8 @@ static int rrd_compare_numeric (const void *a_ptr, const void *b_ptr)
 		return (0);
 } /* int rrd_compare_numeric */
 
-static int rrd_write (const data_set_t *ds, const value_list_t *vl)
+static int rrd_write (const data_set_t *ds, const value_list_t *vl,
+		user_data_t __attribute__((unused)) *user_data)
 {
 	struct stat  statbuf;
 	char         filename[512];
@@ -814,7 +820,8 @@ static int rrd_write (const data_set_t *ds, const value_list_t *vl)
 	return (status);
 } /* int rrd_write */
 
-static int rrd_flush (int timeout, const char *identifier)
+static int rrd_flush (int timeout, const char *identifier,
+		user_data_t __attribute__((unused)) *user_data)
 {
 	pthread_mutex_lock (&cache_lock);
 
@@ -991,13 +998,27 @@ static int rrd_shutdown (void)
 	pthread_cond_signal (&queue_cond);
 	pthread_mutex_unlock (&queue_lock);
 
+	if ((queue_thread_running != 0)
+			&& ((queue_head != NULL) || (flushq_head != NULL)))
+	{
+		INFO ("rrdtool plugin: Shutting down the queue thread. "
+				"This may take a while.");
+	}
+	else if (queue_thread_running != 0)
+	{
+		INFO ("rrdtool plugin: Shutting down the queue thread.");
+	}
+
 	/* Wait for all the values to be written to disk before returning. */
-	if (queue_thread != 0)
+	if (queue_thread_running != 0)
 	{
 		pthread_join (queue_thread, NULL);
-		queue_thread = 0;
+		memset (&queue_thread, 0, sizeof (queue_thread));
+		queue_thread_running = 0;
 		DEBUG ("rrdtool plugin: queue_thread exited.");
 	}
+
+	/* TODO: Maybe it'd be a good idea to free the cache here.. */
 
 	return (0);
 } /* int rrd_shutdown */
@@ -1043,12 +1064,14 @@ static int rrd_init (void)
 
 	pthread_mutex_unlock (&cache_lock);
 
-	status = pthread_create (&queue_thread, NULL, rrd_queue_thread, NULL);
+	status = pthread_create (&queue_thread, /* attr = */ NULL,
+			rrd_queue_thread, /* args = */ NULL);
 	if (status != 0)
 	{
 		ERROR ("rrdtool plugin: Cannot create queue-thread.");
 		return (-1);
 	}
+	queue_thread_running = 1;
 
 	DEBUG ("rrdtool plugin: rrd_init: datadir = %s; stepsize = %i;"
 			" heartbeat = %i; rrarows = %i; xff = %lf;",
@@ -1066,7 +1089,7 @@ void module_register (void)
 	plugin_register_config ("rrdtool", rrd_config,
 			config_keys, config_keys_num);
 	plugin_register_init ("rrdtool", rrd_init);
-	plugin_register_write ("rrdtool", rrd_write);
-	plugin_register_flush ("rrdtool", rrd_flush);
+	plugin_register_write ("rrdtool", rrd_write, /* user_data = */ NULL);
+	plugin_register_flush ("rrdtool", rrd_flush, /* user_data = */ NULL);
 	plugin_register_shutdown ("rrdtool", rrd_shutdown);
 }

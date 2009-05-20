@@ -1,6 +1,7 @@
 /**
  * collectd - src/csv.c
  * Copyright (C) 2007-2009  Florian octo Forster
+ * Copyright (C) 2009       Doug MacEachern
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -17,6 +18,7 @@
  *
  * Authors:
  *   Florian octo Forster <octo at verplant.org>
+ *   Doug MacEachern <dougm@hyperic.com>
  **/
 
 #include "collectd.h"
@@ -249,7 +251,8 @@ static int csv_config (const char *key, const char *value)
 	return (0);
 } /* int csv_config */
 
-static int csv_write (const data_set_t *ds, const value_list_t *vl)
+static int csv_write (const data_set_t *ds, const value_list_t *vl,
+		user_data_t __attribute__((unused)) *user_data)
 {
 	struct stat  statbuf;
 	char         filename[512];
@@ -356,5 +359,5 @@ void module_register (void)
 {
 	plugin_register_config ("csv", csv_config,
 			config_keys, config_keys_num);
-	plugin_register_write ("csv", csv_write);
+	plugin_register_write ("csv", csv_write, /* user_data = */ NULL);
 } /* void module_register */

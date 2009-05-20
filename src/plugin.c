@@ -34,6 +34,7 @@
 #include "configfile.h"
 #include "utils_avltree.h"
 #include "utils_llist.h"
+#include "utils_heap.h"
 #include "utils_cache.h"
 #include "utils_threshold.h"
 #include "filter_chain.h"
@@ -41,12 +42,27 @@
 /*
  * Private structures
  */
+struct callback_func_s
+{
+	void *cf_callback;
+	user_data_t cf_udata;
+};
+typedef struct callback_func_s callback_func_t;
+
+#define RF_SIMPLE  0
+#define RF_COMPLEX 1
 struct read_func_s
 {
-	int wait_time;
-	int wait_left;
-	int (*callback) (void);
-	enum { DONE = 0, TODO = 1, ACTIVE = 2 } needs_read;
+	/* `read_func_t' "inherits" from `callback_func_t'.
+	 * The `rf_super' member MUST be the first one in this structure! */
+#define rf_callback rf_super.cf_callback
+#define rf_udata rf_super.cf_udata
+	callback_func_t rf_super;
+	char rf_name[DATA_MAX_NAME_LEN];
+	int rf_type;
+	struct timespec rf_interval;
+	struct timespec rf_effective_interval;
+	struct timespec rf_next_read;
 };
 typedef struct read_func_s read_func_t;
 
@@ -54,7 +70,6 @@ typedef struct read_func_s read_func_t;
  * Private variables
  */
 static llist_t *list_init;
-static llist_t *list_read;
 static llist_t *list_write;
 static llist_t *list_flush;
 static llist_t *list_shutdown;
@@ -68,6 +83,7 @@ static c_avl_tree_t *data_sets;
 
 static char *plugindir = NULL;
 
+static c_heap_t       *read_heap = NULL;
 static int             read_loop = 1;
 static pthread_mutex_t read_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  read_cond = PTHREAD_COND_INITIALIZER;
@@ -85,26 +101,101 @@ static const char *plugin_get_dir (void)
 		return (plugindir);
 }
 
-static int register_callback (llist_t **list, const char *name, void *callback)
+static void destroy_callback (callback_func_t *cf) /* {{{ */
+{
+	if (cf == NULL)
+		return;
+
+	if ((cf->cf_udata.data != NULL) && (cf->cf_udata.free_func != NULL))
+	{
+		cf->cf_udata.free_func (cf->cf_udata.data);
+		cf->cf_udata.data = NULL;
+		cf->cf_udata.free_func = NULL;
+	}
+	sfree (cf);
+} /* }}} void destroy_callback */
+
+static void destroy_all_callbacks (llist_t **list) /* {{{ */
+{
+	llentry_t *le;
+
+	if (*list == NULL)
+		return;
+
+	le = llist_head (*list);
+	while (le != NULL)
+	{
+		llentry_t *le_next;
+
+		le_next = le->next;
+
+		sfree (le->key);
+		destroy_callback (le->value);
+		le->value = NULL;
+
+		le = le_next;
+	}
+
+	llist_destroy (*list);
+	*list = NULL;
+} /* }}} void destroy_all_callbacks */
+
+static void destroy_read_heap (void) /* {{{ */
+{
+	if (read_heap == NULL)
+		return;
+
+	while (42)
+	{
+		callback_func_t *cf;
+
+		cf = c_head_get_root (read_heap);
+		if (cf == NULL)
+			break;
+
+		destroy_callback (cf);
+	}
+
+	c_heap_destroy (read_heap);
+	read_heap = NULL;
+} /* }}} void destroy_read_heap */
+
+static int register_callback (llist_t **list, /* {{{ */
+		const char *name, callback_func_t *cf)
 {
 	llentry_t *le;
 	char *key;
 
-	if ((*list == NULL)
-			&& ((*list = llist_create ()) == NULL))
+	if (*list == NULL)
+	{
+		*list = llist_create ();
+		if (*list == NULL)
+		{
+			ERROR ("plugin: create_register_callback: "
+					"llist_create failed.");
+			destroy_callback (cf);
+			return (-1);
+		}
+	}
+
+	key = strdup (name);
+	if (key == NULL)
+	{
+		ERROR ("plugin: create_register_callback: strdup failed.");
+		destroy_callback (cf);
 		return (-1);
+	}
 
 	le = llist_search (*list, name);
 	if (le == NULL)
 	{
-		key = strdup (name);
-		if (key == NULL)
-			return (-1);
-
-		le = llentry_create (key, callback);
+		le = llentry_create (key, cf);
 		if (le == NULL)
 		{
+			ERROR ("plugin: create_register_callback: "
+					"llentry_create failed.");
 			free (key);
+			destroy_callback (cf);
 			return (-1);
 		}
 
@@ -112,27 +203,65 @@ static int register_callback (llist_t **list, const char *name, void *callback)
 	}
 	else
 	{
-		le->value = callback;
+		callback_func_t *old_cf;
+
+		old_cf = le->value;
+		le->value = cf;
+
+		destroy_callback (old_cf);
+		sfree (key);
 	}
 
 	return (0);
-} /* int register_callback */
+} /* }}} int register_callback */
 
-static int plugin_unregister (llist_t *list, const char *name)
+static int create_register_callback (llist_t **list, /* {{{ */
+		const char *name, void *callback, user_data_t *ud)
+{
+	callback_func_t *cf;
+
+	cf = (callback_func_t *) malloc (sizeof (*cf));
+	if (cf == NULL)
+	{
+		ERROR ("plugin: create_register_callback: malloc failed.");
+		return (-1);
+	}
+	memset (cf, 0, sizeof (*cf));
+
+	cf->cf_callback = callback;
+	if (ud == NULL)
+	{
+		cf->cf_udata.data = NULL;
+		cf->cf_udata.free_func = NULL;
+	}
+	else
+	{
+		cf->cf_udata = *ud;
+	}
+
+	return (register_callback (list, name, cf));
+} /* }}} int create_register_callback */
+
+static int plugin_unregister (llist_t *list, const char *name) /* {{{ */
 {
 	llentry_t *e;
 
-	e = llist_search (list, name);
+	if (list == NULL)
+		return (-1);
 
+	e = llist_search (list, name);
 	if (e == NULL)
 		return (-1);
 
 	llist_remove (list, e);
-	free (e->key);
+
+	sfree (e->key);
+	destroy_callback (e->value);
+
 	llentry_destroy (e);
 
 	return (0);
-} /* int plugin_unregister */
+} /* }}} int plugin_unregister */
 
 /*
  * (Try to) load the shared object `file'. Won't complain if it isn't a shared
@@ -173,78 +302,144 @@ static int plugin_load_file (char *file)
 
 static void *plugin_read_thread (void __attribute__((unused)) *args)
 {
-	llentry_t   *le;
-	read_func_t *rf;
-	int          status;
-	int          done;
-
-	pthread_mutex_lock (&read_lock);
-
 	while (read_loop != 0)
 	{
-		le = llist_head (list_read);
-		done = 0;
+		read_func_t *rf;
+		struct timeval now;
+		int status;
 
-		while ((read_loop != 0) && (le != NULL))
+		/* Get the read function that needs to be read next. */
+		rf = c_head_get_root (read_heap);
+		if (rf == NULL)
 		{
-			rf = (read_func_t *) le->value;
+			struct timespec abstime;
 
-			if (rf->needs_read != TODO)
-			{
-				le = le->next;
-				continue;
-			}
+			gettimeofday (&now, /* timezone = */ NULL);
 
-			/* We will do this read function */
-			rf->needs_read = ACTIVE;
-
-			DEBUG ("[thread #%5lu] plugin: plugin_read_thread: Handling %s",
-					(unsigned long int) pthread_self (), le->key);
-			pthread_mutex_unlock (&read_lock);
-
-			status = rf->callback ();
-			done++;
-
-			if (status != 0)
-			{
-				if (rf->wait_time < interval_g)
-					rf->wait_time = interval_g;
-				rf->wait_left = rf->wait_time;
-				rf->wait_time = rf->wait_time * 2;
-				if (rf->wait_time > 86400)
-					rf->wait_time = 86400;
-
-				NOTICE ("read-function of plugin `%s' "
-						"failed. Will suspend it for %i "
-						"seconds.", le->key, rf->wait_left);
-			}
-			else
-			{
-				rf->wait_left = 0;
-				rf->wait_time = interval_g;
-			}
+			abstime.tv_sec = now.tv_sec + interval_g;
+			abstime.tv_nsec = 1000 * now.tv_usec;
 
 			pthread_mutex_lock (&read_lock);
-
-			rf->needs_read = DONE;
-			le = le->next;
-		} /* while (le != NULL) */
-
-		if ((read_loop != 0) && (done == 0))
-		{
-			DEBUG ("[thread #%5lu] plugin: plugin_read_thread: Waiting on read_cond.",
-					(unsigned long int) pthread_self ());
-			pthread_cond_wait (&read_cond, &read_lock);
+			pthread_cond_timedwait (&read_cond, &read_lock,
+					&abstime);
+			pthread_mutex_unlock (&read_lock);
+			continue;
 		}
-	} /* while (read_loop) */
 
-	pthread_mutex_unlock (&read_lock);
+		if ((rf->rf_interval.tv_sec == 0) && (rf->rf_interval.tv_nsec == 0))
+		{
+			gettimeofday (&now, /* timezone = */ NULL);
+
+			rf->rf_interval.tv_sec = interval_g;
+			rf->rf_interval.tv_nsec = 0;
+
+			rf->rf_effective_interval = rf->rf_interval;
+
+			rf->rf_next_read.tv_sec = now.tv_sec;
+			rf->rf_next_read.tv_nsec = 1000 * now.tv_usec;
+		}
+
+		/* sleep until this entry is due,
+		 * using pthread_cond_timedwait */
+		pthread_mutex_lock (&read_lock);
+		pthread_cond_timedwait (&read_cond, &read_lock,
+				&rf->rf_next_read);
+		pthread_mutex_unlock (&read_lock);
+
+		/* Check if we're supposed to stop.. This may have interrupted
+		 * the sleep, too. */
+		if (read_loop == 0)
+		{
+			/* Insert `rf' again, so it can be free'd correctly */
+			c_heap_insert (read_heap, rf);
+			break;
+		}
+
+		DEBUG ("plugin_read_thread: Handling `%s'.", rf->rf_name);
+
+		if (rf->rf_type == RF_SIMPLE)
+		{
+			int (*callback) (void);
+
+			callback = rf->rf_callback;
+			status = (*callback) ();
+		}
+		else
+		{
+			plugin_read_cb callback;
+
+			callback = rf->rf_callback;
+			status = (*callback) (&rf->rf_udata);
+		}
+
+		/* If the function signals failure, we will increase the
+		 * intervals in which it will be called. */
+		if (status != 0)
+		{
+			rf->rf_effective_interval.tv_sec *= 2;
+			rf->rf_effective_interval.tv_nsec *= 2;
+			NORMALIZE_TIMESPEC (rf->rf_effective_interval);
+
+			if (rf->rf_effective_interval.tv_sec >= 86400)
+			{
+				rf->rf_effective_interval.tv_sec = 86400;
+				rf->rf_effective_interval.tv_nsec = 0;
+			}
+
+			NOTICE ("read-function of plugin `%s' failed. "
+					"Will suspend it for %i seconds.",
+					rf->rf_name,
+					(int) rf->rf_effective_interval.tv_sec);
+		}
+		else
+		{
+			/* Success: Restore the interval, if it was changed. */
+			rf->rf_effective_interval = rf->rf_interval;
+		}
+
+		/* update the ``next read due'' field */
+		gettimeofday (&now, /* timezone = */ NULL);
+
+		DEBUG ("plugin_read_thread: Effective interval of the "
+				"%s plugin is %i.%09i.",
+				rf->rf_name,
+				(int) rf->rf_effective_interval.tv_sec,
+				(int) rf->rf_effective_interval.tv_nsec);
+
+		/* Calculate the next (absolute) time at which this function
+		 * should be called. */
+		rf->rf_next_read.tv_sec = rf->rf_next_read.tv_sec
+			+ rf->rf_effective_interval.tv_sec;
+		rf->rf_next_read.tv_nsec = rf->rf_next_read.tv_nsec
+			+ rf->rf_effective_interval.tv_nsec;
+		NORMALIZE_TIMESPEC (rf->rf_next_read);
+
+		/* Check, if `rf_next_read' is in the past. */
+		if ((rf->rf_next_read.tv_sec < now.tv_sec)
+				|| ((rf->rf_next_read.tv_sec == now.tv_sec)
+					&& (rf->rf_next_read.tv_nsec < (1000 * now.tv_usec))))
+		{
+			/* `rf_next_read' is in the past. Insert `now'
+			 * so this value doesn't trail off into the
+			 * past too much. */
+			rf->rf_next_read.tv_sec = now.tv_sec;
+			rf->rf_next_read.tv_nsec = 1000 * now.tv_usec;
+		}
+
+		DEBUG ("plugin_read_thread: Next read of the %s plugin at %i.%09i.",
+				rf->rf_name,
+				(int) rf->rf_next_read.tv_sec,
+				(int) rf->rf_next_read.tv_nsec);
+
+		/* Re-insert this read function into the heap again. */
+		c_heap_insert (read_heap, rf);
+	} /* while (read_loop) */
 
 	pthread_exit (NULL);
 	return ((void *) 0);
 } /* void *plugin_read_thread */
 
-static void start_threads (int num)
+static void start_read_threads (int num)
 {
 	int i;
 
@@ -254,7 +449,7 @@ static void start_threads (int num)
 	read_threads = (pthread_t *) calloc (num, sizeof (pthread_t));
 	if (read_threads == NULL)
 	{
-		ERROR ("plugin: start_threads: calloc failed.");
+		ERROR ("plugin: start_read_threads: calloc failed.");
 		return;
 	}
 
@@ -268,22 +463,24 @@ static void start_threads (int num)
 		}
 		else
 		{
-			ERROR ("plugin: start_threads: pthread_create failed.");
+			ERROR ("plugin: start_read_threads: pthread_create failed.");
 			return;
 		}
 	} /* for (i) */
-} /* void start_threads */
+} /* void start_read_threads */
 
-static void stop_threads (void)
+static void stop_read_threads (void)
 {
 	int i;
 
 	if (read_threads == NULL)
 		return;
 
+	INFO ("collectd: Stopping %i read threads.", read_threads_num);
+
 	pthread_mutex_lock (&read_lock);
 	read_loop = 0;
-	DEBUG ("plugin: stop_threads: Signalling `read_cond'");
+	DEBUG ("plugin: stop_read_threads: Signalling `read_cond'");
 	pthread_cond_broadcast (&read_cond);
 	pthread_mutex_unlock (&read_lock);
 
@@ -291,13 +488,13 @@ static void stop_threads (void)
 	{
 		if (pthread_join (read_threads[i], NULL) != 0)
 		{
-			ERROR ("plugin: stop_threads: pthread_join failed.");
+			ERROR ("plugin: stop_read_threads: pthread_join failed.");
 		}
 		read_threads[i] = (pthread_t) 0;
 	}
 	sfree (read_threads);
 	read_threads_num = 0;
-} /* void stop_threads */
+} /* void stop_read_threads */
 
 /*
  * Public functions
@@ -376,6 +573,7 @@ int plugin_load (const char *type)
 		else if (!S_ISREG (statbuf.st_mode))
 		{
 			/* don't follow symlinks */
+			WARNING ("stat %s: not a regular file", filename);
 			continue;
 		}
 
@@ -419,13 +617,45 @@ int plugin_register_complex_config (const char *type,
 int plugin_register_init (const char *name,
 		int (*callback) (void))
 {
-	return (register_callback (&list_init, name, (void *) callback));
+	return (create_register_callback (&list_init, name, (void *) callback,
+				/* user_data = */ NULL));
 } /* plugin_register_init */
+
+static int plugin_compare_read_func (const void *arg0, const void *arg1)
+{
+	const read_func_t *rf0;
+	const read_func_t *rf1;
+
+	rf0 = arg0;
+	rf1 = arg1;
+
+	if (rf0->rf_next_read.tv_sec < rf1->rf_next_read.tv_sec)
+		return (-1);
+	else if (rf0->rf_next_read.tv_sec > rf1->rf_next_read.tv_sec)
+		return (1);
+	else if (rf0->rf_next_read.tv_nsec < rf1->rf_next_read.tv_nsec)
+		return (-1);
+	else if (rf0->rf_next_read.tv_nsec > rf1->rf_next_read.tv_nsec)
+		return (1);
+	else
+		return (0);
+} /* int plugin_compare_read_func */
 
 int plugin_register_read (const char *name,
 		int (*callback) (void))
 {
 	read_func_t *rf;
+
+	if (read_heap == NULL)
+	{
+		read_heap = c_heap_create (plugin_compare_read_func);
+		if (read_heap == NULL)
+		{
+			ERROR ("plugin_register_read: "
+					"c_heap_create failed.");
+			return (-1);
+		}
+	}
 
 	rf = (read_func_t *) malloc (sizeof (read_func_t));
 	if (rf == NULL)
@@ -436,31 +666,86 @@ int plugin_register_read (const char *name,
 		return (-1);
 	}
 
-	memset (rf, '\0', sizeof (read_func_t));
-	rf->wait_time = interval_g;
-	rf->wait_left = 0;
-	rf->callback = callback;
-	rf->needs_read = DONE;
+	memset (rf, 0, sizeof (read_func_t));
+	rf->rf_callback = (void *) callback;
+	rf->rf_udata.data = NULL;
+	rf->rf_udata.free_func = NULL;
+	sstrncpy (rf->rf_name, name, sizeof (rf->rf_name));
+	rf->rf_type = RF_SIMPLE;
+	rf->rf_interval.tv_sec = 0;
+	rf->rf_interval.tv_nsec = 0;
+	rf->rf_effective_interval = rf->rf_interval;
 
-	return (register_callback (&list_read, name, (void *) rf));
+	return (c_heap_insert (read_heap, rf));
 } /* int plugin_register_read */
 
-int plugin_register_write (const char *name,
-		int (*callback) (const data_set_t *ds, const value_list_t *vl))
+int plugin_register_complex_read (const char *name,
+		plugin_read_cb callback,
+		const struct timespec *interval,
+		user_data_t *user_data)
 {
-	return (register_callback (&list_write, name, (void *) callback));
+	read_func_t *rf;
+
+	if (read_heap == NULL)
+	{
+		read_heap = c_heap_create (plugin_compare_read_func);
+		if (read_heap == NULL)
+		{
+			ERROR ("plugin_register_read: c_heap_create failed.");
+			return (-1);
+		}
+	}
+
+	rf = (read_func_t *) malloc (sizeof (read_func_t));
+	if (rf == NULL)
+	{
+		ERROR ("plugin_register_complex_read: malloc failed.");
+		return (-1);
+	}
+
+	memset (rf, 0, sizeof (read_func_t));
+	rf->rf_callback = (void *) callback;
+	sstrncpy (rf->rf_name, name, sizeof (rf->rf_name));
+	rf->rf_type = RF_COMPLEX;
+	if (interval != NULL)
+	{
+		rf->rf_interval = *interval;
+	}
+	rf->rf_effective_interval = rf->rf_interval;
+
+	/* Set user data */
+	if (user_data == NULL)
+	{
+		rf->rf_udata.data = NULL;
+		rf->rf_udata.free_func = NULL;
+	}
+	else
+	{
+		rf->rf_udata = *user_data;
+	}
+
+	return (c_heap_insert (read_heap, rf));
+} /* int plugin_register_complex_read */
+
+int plugin_register_write (const char *name,
+		plugin_write_cb callback, user_data_t *ud)
+{
+	return (create_register_callback (&list_write, name,
+				(void *) callback, ud));
 } /* int plugin_register_write */
 
 int plugin_register_flush (const char *name,
-		int (*callback) (const int timeout, const char *identifier))
+		plugin_flush_cb callback, user_data_t *ud)
 {
-	return (register_callback (&list_flush, name, (void *) callback));
+	return (create_register_callback (&list_flush, name,
+				(void *) callback, ud));
 } /* int plugin_register_flush */
 
 int plugin_register_shutdown (char *name,
 		int (*callback) (void))
 {
-	return (register_callback (&list_shutdown, name, (void *) callback));
+	return (create_register_callback (&list_shutdown, name,
+				(void *) callback, /* user_data = */ NULL));
 } /* int plugin_register_shutdown */
 
 int plugin_register_data_set (const data_set_t *ds)
@@ -500,16 +785,18 @@ int plugin_register_data_set (const data_set_t *ds)
 	return (c_avl_insert (data_sets, (void *) ds_copy->type, (void *) ds_copy));
 } /* int plugin_register_data_set */
 
-int plugin_register_log (char *name,
-		void (*callback) (int priority, const char *msg))
+int plugin_register_log (const char *name,
+		plugin_log_cb callback, user_data_t *ud)
 {
-	return (register_callback (&list_log, name, (void *) callback));
+	return (create_register_callback (&list_log, name,
+				(void *) callback, ud));
 } /* int plugin_register_log */
 
 int plugin_register_notification (const char *name,
-		int (*callback) (const notification_t *notif))
+		plugin_notification_cb callback, user_data_t *ud)
 {
-	return (register_callback (&list_notification, name, (void *) callback));
+	return (create_register_callback (&list_notification, name,
+				(void *) callback, ud));
 } /* int plugin_register_log */
 
 int plugin_unregister_config (const char *name)
@@ -531,19 +818,9 @@ int plugin_unregister_init (const char *name)
 
 int plugin_unregister_read (const char *name)
 {
-	llentry_t *e;
-
-	e = llist_search (list_read, name);
-
-	if (e == NULL)
-		return (-1);
-
-	llist_remove (list_read, e);
-	free (e->value);
-	free (e->key);
-	llentry_destroy (e);
-
-	return (0);
+	/* TODO: Implement removal of a specific key from the heap. */
+	assert (0);
+	return (-1);
 }
 
 int plugin_unregister_write (const char *name)
@@ -590,7 +867,6 @@ int plugin_unregister_notification (const char *name)
 void plugin_init_all (void)
 {
 	const char *chain_name;
-	int (*callback) (void);
 	llentry_t *le;
 	int status;
 
@@ -604,7 +880,7 @@ void plugin_init_all (void)
 	post_cache_chain = fc_chain_get_by_name (chain_name);
 
 
-	if ((list_init == NULL) && (list_read == NULL))
+	if ((list_init == NULL) && (read_heap == NULL))
 		return;
 
 	/* Calling all init callbacks before checking if read callbacks
@@ -613,7 +889,11 @@ void plugin_init_all (void)
 	le = llist_head (list_init);
 	while (le != NULL)
 	{
-		callback = (int (*) (void)) le->value;
+		callback_func_t *cf;
+		plugin_init_cb callback;
+
+		cf = le->value;
+		callback = cf->cf_callback;
 		status = (*callback) ();
 
 		if (status != 0)
@@ -633,82 +913,68 @@ void plugin_init_all (void)
 	}
 
 	/* Start read-threads */
-	if (list_read != NULL)
+	if (read_heap != NULL)
 	{
 		const char *rt;
 		int num;
 		rt = global_option_get ("ReadThreads");
 		num = atoi (rt);
 		if (num != -1)
-			start_threads ((num > 0) ? num : 5);
+			start_read_threads ((num > 0) ? num : 5);
 	}
 } /* void plugin_init_all */
 
+/* TODO: Rename this function. */
 void plugin_read_all (void)
 {
-	llentry_t   *le;
-	read_func_t *rf;
-
 	uc_check_timeout ();
 
-	if (list_read == NULL)
-		return;
-
-	pthread_mutex_lock (&read_lock);
-
-	le = llist_head (list_read);
-	while (le != NULL)
-	{
-		rf = (read_func_t *) le->value;
-
-		if (rf->needs_read != DONE)
-		{
-			le = le->next;
-			continue;
-		}
-
-		if (rf->wait_left > 0)
-			rf->wait_left -= interval_g;
-
-		if (rf->wait_left <= 0)
-		{
-			rf->needs_read = TODO;
-		}
-
-		le = le->next;
-	}
-
-	DEBUG ("plugin: plugin_read_all: Signalling `read_cond'");
-	pthread_cond_broadcast (&read_cond);
-	pthread_mutex_unlock (&read_lock);
+	return;
 } /* void plugin_read_all */
 
 /* Read function called when the `-T' command line argument is given. */
 int plugin_read_all_once (void)
 {
-	llentry_t   *le;
-	read_func_t *rf;
 	int status;
 	int return_status = 0;
 
-	if (list_read == NULL)
+	if (read_heap == NULL)
 	{
 		NOTICE ("No read-functions are registered.");
 		return (0);
 	}
 
-	for (le = llist_head (list_read);
-	     le != NULL;
-	     le = le->next)
+	while (42)
 	{
-		rf = (read_func_t *) le->value;
-		status = rf->callback ();
+		read_func_t *rf;
+
+		rf = c_head_get_root (read_heap);
+		if (rf == NULL)
+			break;
+
+		if (rf->rf_type == RF_SIMPLE)
+		{
+			int (*callback) (void);
+
+			callback = rf->rf_callback;
+			status = (*callback) ();
+		}
+		else
+		{
+			plugin_read_cb callback;
+
+			callback = rf->rf_callback;
+			status = (*callback) (&rf->rf_udata);
+		}
+
 		if (status != 0)
 		{
 			NOTICE ("read-function of plugin `%s' failed.",
-				le->key);
+					rf->rf_name);
 			return_status = -1;
 		}
+
+		destroy_callback ((void *) rf);
 	}
 
 	return (return_status);
@@ -717,7 +983,6 @@ int plugin_read_all_once (void)
 int plugin_write (const char *plugin, /* {{{ */
 		const data_set_t *ds, const value_list_t *vl)
 {
-  int (*callback) (const data_set_t *ds, const value_list_t *vl);
   llentry_t *le;
   int status;
 
@@ -745,8 +1010,12 @@ int plugin_write (const char *plugin, /* {{{ */
     le = llist_head (list_write);
     while (le != NULL)
     {
-      callback = le->value;
-      status = (*callback) (ds, vl);
+      callback_func_t *cf = le->value;
+      plugin_write_cb callback;
+
+      DEBUG ("plugin: plugin_write: Writing values via %s.", le->key);
+      callback = cf->cf_callback;
+      status = (*callback) (ds, vl, &cf->cf_udata);
       if (status != 0)
         failure++;
       else
@@ -762,6 +1031,9 @@ int plugin_write (const char *plugin, /* {{{ */
   }
   else /* plugin != NULL */
   {
+    callback_func_t *cf;
+    plugin_write_cb callback;
+
     le = llist_head (list_write);
     while (le != NULL)
     {
@@ -774,8 +1046,11 @@ int plugin_write (const char *plugin, /* {{{ */
     if (le == NULL)
       return (ENOENT);
 
-    callback = le->value;
-    status = (*callback) (ds, vl);
+    cf = le->value;
+
+    DEBUG ("plugin: plugin_write: Writing values via %s.", le->key);
+    callback = cf->cf_callback;
+    status = (*callback) (ds, vl, &cf->cf_udata);
   }
 
   return (status);
@@ -783,7 +1058,6 @@ int plugin_write (const char *plugin, /* {{{ */
 
 int plugin_flush (const char *plugin, int timeout, const char *identifier)
 {
-  int (*callback) (int timeout, const char *identifier);
   llentry_t *le;
 
   if (list_flush == NULL)
@@ -792,6 +1066,9 @@ int plugin_flush (const char *plugin, int timeout, const char *identifier)
   le = llist_head (list_flush);
   while (le != NULL)
   {
+    callback_func_t *cf;
+    plugin_flush_cb callback;
+
     if ((plugin != NULL)
         && (strcmp (plugin, le->key) != 0))
     {
@@ -799,8 +1076,10 @@ int plugin_flush (const char *plugin, int timeout, const char *identifier)
       continue;
     }
 
-    callback = (int (*) (int, const char *)) le->value;
-    (*callback) (timeout, identifier);
+    cf = le->value;
+    callback = cf->cf_callback;
+
+    (*callback) (timeout, identifier, &cf->cf_udata);
 
     le = le->next;
   }
@@ -809,18 +1088,27 @@ int plugin_flush (const char *plugin, int timeout, const char *identifier)
 
 void plugin_shutdown_all (void)
 {
-	int (*callback) (void);
 	llentry_t *le;
 
-	stop_threads ();
+	stop_read_threads ();
 
-	if (list_shutdown == NULL)
-		return;
+	destroy_all_callbacks (&list_init);
+	destroy_read_heap ();
 
-	le = llist_head (list_shutdown);
+	plugin_flush (/* plugin = */ NULL, /* timeout = */ -1,
+			/* identifier = */ NULL);
+
+	le = NULL;
+	if (list_shutdown != NULL)
+		le = llist_head (list_shutdown);
+
 	while (le != NULL)
 	{
-		callback = (int (*) (void)) le->value;
+		callback_func_t *cf;
+		plugin_shutdown_cb callback;
+
+		cf = le->value;
+		callback = cf->cf_callback;
 
 		/* Advance the pointer before calling the callback allows
 		 * shutdown functions to unregister themselves. If done the
@@ -830,6 +1118,12 @@ void plugin_shutdown_all (void)
 
 		(*callback) ();
 	}
+
+	destroy_all_callbacks (&list_write);
+	destroy_all_callbacks (&list_flush);
+	destroy_all_callbacks (&list_notification);
+	destroy_all_callbacks (&list_shutdown);
+	destroy_all_callbacks (&list_log);
 } /* void plugin_shutdown_all */
 
 int plugin_dispatch_values (value_list_t *vl)
@@ -871,6 +1165,9 @@ int plugin_dispatch_values (value_list_t *vl)
 
 	if (vl->time == 0)
 		vl->time = time (NULL);
+
+	if (vl->interval <= 0)
+		vl->interval = interval_g;
 
 	DEBUG ("plugin_dispatch_values: time = %u; interval = %i; "
 			"host = %s; "
@@ -988,7 +1285,6 @@ int plugin_dispatch_values (value_list_t *vl)
 
 int plugin_dispatch_notification (const notification_t *notif)
 {
-	int (*callback) (const notification_t *);
 	llentry_t *le;
 	/* Possible TODO: Add flap detection here */
 
@@ -1004,8 +1300,19 @@ int plugin_dispatch_notification (const notification_t *notif)
 	le = llist_head (list_notification);
 	while (le != NULL)
 	{
-		callback = (int (*) (const notification_t *)) le->value;
-		(*callback) (notif);
+		callback_func_t *cf;
+		plugin_notification_cb callback;
+		int status;
+
+		cf = le->value;
+		callback = cf->cf_callback;
+		status = (*callback) (notif, &cf->cf_udata);
+		if (status != 0)
+		{
+			WARNING ("plugin_dispatch_notification: Notification "
+					"callback %s returned %i.",
+					le->key, status);
+		}
 
 		le = le->next;
 	}
@@ -1017,8 +1324,6 @@ void plugin_log (int level, const char *format, ...)
 {
 	char msg[1024];
 	va_list ap;
-
-	void (*callback) (int, const char *);
 	llentry_t *le;
 
 	if (list_log == NULL)
@@ -1037,8 +1342,13 @@ void plugin_log (int level, const char *format, ...)
 	le = llist_head (list_log);
 	while (le != NULL)
 	{
-		callback = (void (*) (int, const char *)) le->value;
-		(*callback) (level, msg);
+		callback_func_t *cf;
+		plugin_log_cb callback;
+
+		cf = le->value;
+		callback = cf->cf_callback;
+
+		(*callback) (level, msg, &cf->cf_udata);
 
 		le = le->next;
 	}
@@ -1231,3 +1541,5 @@ int plugin_notification_meta_free (notification_meta_t *n)
 
   return (0);
 } /* int plugin_notification_meta_free */
+
+/* vim: set sw=8 ts=8 noet fdm=marker : */

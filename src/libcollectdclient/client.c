@@ -19,37 +19,12 @@
  *   Florian octo Forster <octo at verplant.org>
  **/
 
-/* Set to C99 and POSIX code */
-#ifndef _ISOC99_SOURCE
-# define _ISOC99_SOURCE
-#endif
-#ifndef _POSIX_SOURCE
-# define _POSIX_SOURCE
-#endif
-#ifndef _POSIX_C_SOURCE
-# define _POSIX_C_SOURCE 200112L
-#endif
-#ifndef _REENTRANT
-# define _REENTRANT
-#endif
-
-/* Disable non-standard extensions */
-#ifdef _BSD_SOURCE
-# undef _BSD_SOURCE
-#endif
-#ifdef _SVID_SOURCE
-# undef _SVID_SOURCE
-#endif
-#ifdef _GNU_SOURCE
-# undef _GNU_SOURCE
+#if HAVE_CONFIG_H
+# include "config.h"
 #endif
 
 #if !defined(__GNUC__) || !__GNUC__
 # define __attribute__(x) /**/
-#endif
-
-#if HAVE_CONFIG_H
-# include "config.h"
 #endif
 
 #include "lcc_features.h"
@@ -72,6 +47,15 @@
  * to no longer define it. We'll use the old, RFC 2553 value here. */
 #ifndef NI_MAXHOST
 # define NI_MAXHOST 1025
+#endif
+
+/* OpenBSD doesn't have EPROTO, FreeBSD doesn't have EILSEQ. Oh what joy! */
+#ifndef EILSEQ
+# ifdef EPROTO
+#  define EILSEQ EPROTO
+# else
+#  define EILSEQ EINVAL
+# endif
 #endif
 
 /* Secure/static macros. They work like `strcpy' and `strcat', but assure null
@@ -129,12 +113,52 @@ typedef struct lcc_response_s lcc_response_t;
 /*
  * Private functions
  */
+/* Even though Posix requires "strerror_r" to return an "int",
+ * some systems (e.g. the GNU libc) return a "char *" _and_
+ * ignore the second argument ... -tokkee */
+char *sstrerror (int errnum, char *buf, size_t buflen)
+{
+  buf[0] = 0;
+
+#if !HAVE_STRERROR_R
+  snprintf (buf, buflen, "Error #%i; strerror_r is not available.", errnum);
+/* #endif !HAVE_STRERROR_R */
+
+#elif STRERROR_R_CHAR_P
+  {
+    char *temp;
+    temp = strerror_r (errnum, buf, buflen);
+    if (buf[0] == 0)
+    {
+      if ((temp != NULL) && (temp != buf) && (temp[0] != 0))
+        strncpy (buf, temp, buflen);
+      else
+        strncpy (buf, "strerror_r did not return "
+            "an error message", buflen);
+    }
+  }
+/* #endif STRERROR_R_CHAR_P */
+
+#else
+  if (strerror_r (errnum, buf, buflen) != 0)
+  {
+    snprintf (buf, buflen, "Error #%i; "
+        "Additionally, strerror_r failed.",
+        errnum);
+  }
+#endif /* STRERROR_R_CHAR_P */
+
+  buf[buflen - 1] = 0;
+
+  return (buf);
+} /* char *sstrerror */
+
 static int lcc_set_errno (lcc_connection_t *c, int err) /* {{{ */
 {
   if (c == NULL)
     return (-1);
 
-  strerror_r (err, c->errbuf, sizeof (c->errbuf));
+  sstrerror (err, c->errbuf, sizeof (c->errbuf));
   c->errbuf[sizeof (c->errbuf) - 1] = 0;
 
   return (0);

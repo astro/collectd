@@ -67,4 +67,7 @@
 #define TYPE_MESSAGE         0x0100
 #define TYPE_SEVERITY        0x0101
 
+#define TYPE_SIGN_SHA256     0x0200
+#define TYPE_ENCR_AES256     0x0210
+
 #endif /* NETWORK_H */

@@ -98,7 +98,7 @@ ssize_t swrite (int fd, const void *buf, size_t count);
  *
  * DESCRIPTION
  *   Splits a string into parts and stores pointers to the parts in `fields'.
- *   The characters split at are ` ' (space) and "\t" (tab).
+ *   The characters split at are: " ", "\t", "\r", and "\n".
  *
  * PARAMETERS
  *   `string'      String to split. This string will be modified. `fields' will
@@ -158,7 +158,47 @@ int strjoin (char *dst, size_t dst_len, char **fields, size_t fields_num, const 
  */
 int escape_slashes (char *buf, int buf_len);
 
+/*
+ * NAME
+ *   replace_special
+ *
+ * DESCRIPTION
+ *   Replaces any special characters (anything that's not alpha-numeric or a
+ *   dash) with an underscore.
+ *
+ *   E.g. "foo$bar&" would become "foo_bar_".
+ *
+ * PARAMETERS
+ *   `buffer'      String to be handled.
+ *   `buffer_size' Length of the string. The function returns after
+ *                 encountering a null-byte or reading this many bytes.
+ */
+void replace_special (char *buffer, size_t buffer_size);
+
 int strsubstitute (char *str, char c_from, char c_to);
+
+/*
+ * NAME
+ *   strunescape
+ *
+ * DESCRIPTION
+ *   Replaces any escaped characters in a string with the appropriate special
+ *   characters. The following escaped characters are recognized:
+ *
+ *     \t -> <tab>
+ *     \n -> <newline>
+ *     \r -> <carriage return>
+ *
+ *   For all other escacped characters only the backslash will be removed.
+ *
+ * PARAMETERS
+ *   `buf'         String to be unescaped.
+ *   `buf_len'     Length of the string, including the terminating null-byte.
+ *
+ * RETURN VALUE
+ *   Returns zero upon success, a value less than zero else.
+ */
+int strunescape (char *buf, size_t buf_len);
 
 /*
  * NAME
@@ -180,6 +220,13 @@ int timeval_cmp (struct timeval tv0, struct timeval tv1, struct timeval *delta);
 	do { \
 		(tv).tv_sec += (tv).tv_usec / 1000000; \
 		(tv).tv_usec = (tv).tv_usec % 1000000; \
+	} while (0)
+
+/* make sure tv_sec stores less than a second */
+#define NORMALIZE_TIMESPEC(tv) \
+	do { \
+		(tv).tv_sec += (tv).tv_nsec / 1000000000; \
+		(tv).tv_nsec = (tv).tv_nsec % 1000000000; \
 	} while (0)
 
 int check_create_dir (const char *file_orig);
@@ -213,6 +260,7 @@ int format_name (char *ret, int ret_len,
 int parse_identifier (char *str, char **ret_host,
 		char **ret_plugin, char **ret_plugin_instance,
 		char **ret_type, char **ret_type_instance);
+int parse_value (const char *value, value_t *ret_value, const data_source_t ds);
 int parse_values (char *buffer, value_list_t *vl, const data_set_t *ds);
 
 #if !HAVE_GETPWNAM_R

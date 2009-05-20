@@ -1,6 +1,7 @@
 /**
  * collectd - src/battery.c
  * Copyright (C) 2006,2007  Florian octo Forster
+ * Copyright (C) 2008       Michał Mirosław
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -17,11 +18,14 @@
  *
  * Authors:
  *   Florian octo Forster <octo at verplant.org>
+ *   Michał Mirosław <mirq-linux at rere.qmqm.pl>
  **/
 
 #include "collectd.h"
 #include "common.h"
 #include "plugin.h"
+
+#include "utils_complain.h"
 
 #if HAVE_MACH_MACH_TYPES_H
 #  include <mach/mach_types.h>
@@ -436,6 +440,8 @@ static int battery_read (void)
 /* #endif HAVE_IOKIT_IOKITLIB_H || HAVE_IOKIT_PS_IOPOWERSOURCES_H */
 
 #elif KERNEL_LINUX
+	static c_complain_t acpi_dir_complaint = C_COMPLAIN_INIT_STATIC;
+
 	FILE *fh;
 	char buffer[1024];
 	char filename[256];
@@ -506,8 +512,17 @@ static int battery_read (void)
 			battery_submit ("0", "voltage", voltage);
 	}
 
-	walk_directory (battery_acpi_dir, battery_read_acpi,
-			/* user_data = */ NULL);
+	if (0 == access (battery_acpi_dir, R_OK))
+		walk_directory (battery_acpi_dir, battery_read_acpi,
+				/* user_data = */ NULL);
+	else
+	{
+		char errbuf[1024];
+		c_complain_once (LOG_WARNING, &acpi_dir_complaint,
+				"battery plugin: Failed to access `%s': %s",
+				battery_acpi_dir,
+				sstrerror (errno, errbuf, sizeof (errbuf)));
+	}
 
 #endif /* KERNEL_LINUX */
 

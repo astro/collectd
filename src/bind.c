@@ -21,30 +21,18 @@
  *   Florian Forster <octo at verplant.org>
  **/
 
-/* Set to C99 and POSIX code */
-#ifndef _ISOC99_SOURCE
-# define _ISOC99_SOURCE
-#endif
-#ifndef _POSIX_SOURCE
-# define _POSIX_SOURCE
-#endif
-#ifndef _POSIX_C_SOURCE
-# define _POSIX_C_SOURCE 200112L
-#endif
-#ifndef _REENTRANT
-# define _REENTRANT
-#endif
-#ifndef _XOPEN_SOURCE
-# define _XOPEN_SOURCE 600
-#endif
-#ifndef _BSD_SOURCE
-# define _BSD_SOURCE
-#endif
+#define _XOPEN_SOURCE 600 /* glibc2 needs this for strptime */
 
 #include "collectd.h"
 #include "common.h"
 #include "plugin.h"
 #include "configfile.h"
+
+/* Some versions of libcurl don't include this themselves and then don't have
+ * fd_set available. */
+#if HAVE_SYS_SELECT_H
+# include <sys/select.h>
+#endif
 
 #include <curl/curl.h>
 #include <libxml/parser.h>
@@ -239,19 +227,6 @@ static int memsummary_translation_table_length =
   STATIC_ARRAY_SIZE (memsummary_translation_table);
 /* }}} */
 
-static void remove_special (char *buffer, size_t buffer_size) /* {{{ */
-{
-  size_t i;
-
-  for (i = 0; i < buffer_size; i++)
-  {
-    if (buffer[i] == 0)
-      return;
-    if ((!isalnum ((int) buffer[i])) && (buffer[i] != '-'))
-      buffer[i] = '_';
-  }
-} /* }}} void remove_special */
-
 static void submit (time_t ts, const char *plugin_instance, /* {{{ */
     const char *type, const char *type_instance, value_t value)
 {
@@ -268,13 +243,13 @@ static void submit (time_t ts, const char *plugin_instance, /* {{{ */
   if (plugin_instance) {
     sstrncpy(vl.plugin_instance, plugin_instance,
         sizeof(vl.plugin_instance));
-    remove_special (vl.plugin_instance, sizeof (vl.plugin_instance));
+    replace_special (vl.plugin_instance, sizeof (vl.plugin_instance));
   }
   sstrncpy(vl.type, type, sizeof(vl.type));
   if (type_instance) {
     sstrncpy(vl.type_instance, type_instance,
         sizeof(vl.type_instance));
-    remove_special (vl.plugin_instance, sizeof (vl.plugin_instance));
+    replace_special (vl.plugin_instance, sizeof (vl.plugin_instance));
   }
   plugin_dispatch_values(&vl);
 } /* }}} void submit */
@@ -478,7 +453,7 @@ static int bind_xml_read_timestamp (const char *xpath_expression, /* {{{ */
     return (-1);
   }
 
-  *ret_value = timegm(&tm);
+  *ret_value = mktime(&tm);
 
   xmlXPathFreeObject (xpathObj);
   return (0);

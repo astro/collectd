@@ -21,6 +21,9 @@ Alessandro Iurlano <alessandro.iurlano at gmail.com>
 Alvaro Barcellos <alvaro.barcellos at gmail.com>
  - Don't-fork patch.
 
+Amit Gupta <amit.gupta221 at gmail.com>
+ - Multiple servers in the apache plugin.
+
 Anthony Gialluca <tonyabg at charter.net>
  - apcups plugin.
 
@@ -49,11 +52,17 @@ Doug MacEachern <dougm at hyperic.com>
  - jcollectd (two-way JMX integration).
  - A few other patches to various plugins.
 
+Edward “Koko” Konetzko <konetzed at quixoticagony.com>
+ - fscache plugin.
+
 Fabian Linzberger <e at lefant.net>
  - Percentage aggregation for `collectd-nagios'.
 
 Flavio Stanchina <flavio at stanchina.net>
  - mbmon plugin.
+
+Franck Lombardi
+ - UNIX socket code for the memcached plugin.
 
 Jason Pepas <cell at ices.utexas.edu>
  - nfs plugin.
@@ -68,6 +77,10 @@ Luke Herberling <collectd at c-ware.com>
 
 Lyonel Vincent <lyonel at ezix.org>
  - processes plugin.
+
+Marco Chiappero <marco at absence.it>
+ - uptime plugin.
+ - ip6tables support in the iptables plugin.
 
 Michael Stapelberg <michael+git at stapelberg.de>
  - OpenBSD port of the tcpconns plugin.
@@ -107,14 +120,23 @@ Richard W. M. Jones <rjones at redhat.com>
 Roman Klesel <roman.klesel at noris.de>
  - Oracle schema and sample SQL statements to be used with the Oracle plugin.
 
+Rodolphe Quiédeville <rquiedeville at bearstech.com>
+ - Lock statistics in the mysql plugin.
+
 Scott Garrett <sgarrett at technomancer.com>
  - tape plugin.
+
+Simon Kuhnle <simon at blarzwurst.de>
+ - OpenBSD code for the cpu and memory plugins.
 
 Sjoerd van der Berg <harekiet at gmail.com>
  - iptables plugin.
 
 Stefan Hacker <stefan.hacker at web.de>
  - teamspeak2 plugin.
+
+Tomasz Pala <gotar at pld-linux.org>
+ - conntrack plugin.
 
 Tommie Gannert <d00-tga at d.kth.se>
  - PID-file patch.

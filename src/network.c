@@ -1,6 +1,6 @@
 /**
  * collectd - src/network.c
- * Copyright (C) 2005-2008  Florian octo Forster
+ * Copyright (C) 2005-2009  Florian octo Forster
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -19,10 +19,13 @@
  *   Florian octo Forster <octo at verplant.org>
  **/
 
+#define _BSD_SOURCE /* For struct ip_mreq */
+
 #include "collectd.h"
 #include "plugin.h"
 #include "common.h"
 #include "configfile.h"
+#include "utils_fbhash.h"
 #include "utils_avltree.h"
 
 #include "network.h"
@@ -46,6 +49,10 @@
 # include <poll.h>
 #endif
 
+#if HAVE_LIBGCRYPT
+# include <gcrypt.h>
+#endif
+
 /* 1500 - 40 - 8  =  Ethernet packet - IPv6 header - UDP header */
 /* #define BUFF_SIZE 1452 */
 
@@ -57,17 +64,69 @@
 # endif
 #endif /* !IP_ADD_MEMBERSHIP */
 
+/* Buffer size to allocate. */
 #define BUFF_SIZE 1024
+
+/*
+ * Maximum size required for encryption / signing:
+ *
+ *    42 bytes for the encryption header
+ * +  64 bytes for the username
+ * -----------
+ * = 106 bytes
+ */
+#define BUFF_SIG_SIZE 106
 
 /*
  * Private data types
  */
-typedef struct sockent
+#define SECURITY_LEVEL_NONE     0
+#if HAVE_LIBGCRYPT
+# define SECURITY_LEVEL_SIGN    1
+# define SECURITY_LEVEL_ENCRYPT 2
+#endif
+struct sockent_client
 {
-	int                      fd;
+	int fd;
 	struct sockaddr_storage *addr;
 	socklen_t                addrlen;
-	struct sockent          *next;
+#if HAVE_LIBGCRYPT
+	int security_level;
+	char *username;
+	char *password;
+	gcry_cipher_hd_t cypher;
+	unsigned char password_hash[32];
+#endif
+};
+
+struct sockent_server
+{
+	int *fd;
+	size_t fd_num;
+#if HAVE_LIBGCRYPT
+	int security_level;
+	char *auth_file;
+	fbhash_t *userdb;
+	gcry_cipher_hd_t cypher;
+#endif
+};
+
+typedef struct sockent
+{
+#define SOCKENT_TYPE_CLIENT 1
+#define SOCKENT_TYPE_SERVER 2
+	int type;
+
+	char *node;
+	char *service;
+
+	union
+	{
+		struct sockent_client client;
+		struct sockent_server server;
+	} data;
+
+	struct sockent *next;
 } sockent_t;
 
 /*                      1 1 1 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 3 3
@@ -136,10 +195,58 @@ struct part_values_s
 };
 typedef struct part_values_s part_values_t;
 
+/*                      1 1 1 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 3 3
+ *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ * +-------------------------------+-------------------------------+
+ * ! Type                          ! Length                        !
+ * +-------------------------------+-------------------------------+
+ * ! Hash (Bits   0 -  31)                                         !
+ * : :                                                             :
+ * ! Hash (Bits 224 - 255)                                         !
+ * +---------------------------------------------------------------+
+ */
+/* Minimum size */
+#define PART_SIGNATURE_SHA256_SIZE 36
+struct part_signature_sha256_s
+{
+  part_header_t head;
+  unsigned char hash[32];
+  char *username;
+};
+typedef struct part_signature_sha256_s part_signature_sha256_t;
+
+/*                      1 1 1 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 3 3
+ *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ * +-------------------------------+-------------------------------+
+ * ! Type                          ! Length                        !
+ * +-------------------------------+-------------------------------+
+ * ! Original length               ! Padding (0 - 15 bytes)        !
+ * +-------------------------------+-------------------------------+
+ * ! Hash (Bits   0 -  31)                                         !
+ * : :                                                             :
+ * ! Hash (Bits 128 - 159)                                         !
+ * +---------------------------------------------------------------+
+ */
+/* Minimum size */
+#define PART_ENCRYPTION_AES256_SIZE 42
+struct part_encryption_aes256_s
+{
+  part_header_t head;
+  uint16_t username_length;
+  char *username;
+  unsigned char iv[16];
+  /* <encrypted> */
+  unsigned char hash[20];
+  /*   <payload /> */
+  /* </encrypted> */
+};
+typedef struct part_encryption_aes256_s part_encryption_aes256_t;
+
 struct receive_list_entry_s
 {
   char data[BUFF_SIZE];
   int  data_len;
+  int  fd;
   struct receive_list_entry_s *next;
 };
 typedef struct receive_list_entry_s receive_list_entry_t;
@@ -147,16 +254,6 @@ typedef struct receive_list_entry_s receive_list_entry_t;
 /*
  * Private variables
  */
-static const char *config_keys[] =
-{
-	"CacheFlush",
-	"Listen",
-	"Server",
-	"TimeToLive",
-	"Forward"
-};
-static int config_keys_num = STATIC_ARRAY_SIZE (config_keys);
-
 static int network_config_ttl = 0;
 static int network_config_forward = 0;
 
@@ -167,20 +264,29 @@ static receive_list_entry_t *receive_list_tail = NULL;
 static pthread_mutex_t       receive_list_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t        receive_list_cond = PTHREAD_COND_INITIALIZER;
 
-static struct pollfd *listen_sockets = NULL;
-static int listen_sockets_num = 0;
+static sockent_t     *listen_sockets = NULL;
+static struct pollfd *listen_sockets_pollfd = NULL;
+static size_t         listen_sockets_num = 0;
 
-static int listen_loop = 0;
-static pthread_t receive_thread_id = 0;
-static pthread_t dispatch_thread_id = 0;
+/* The receive and dispatch threads will run as long as `listen_loop' is set to
+ * zero. */
+static int       listen_loop = 0;
+static int       receive_thread_running = 0;
+static pthread_t receive_thread_id;
+static int       dispatch_thread_running = 0;
+static pthread_t dispatch_thread_id;
 
-static char         send_buffer[BUFF_SIZE];
-static char        *send_buffer_ptr;
-static int          send_buffer_fill;
-static value_list_t send_buffer_vl = VALUE_LIST_STATIC;
-static pthread_mutex_t send_buffer_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Buffer in which to-be-sent network packets are constructed. */
+static char             send_buffer[BUFF_SIZE];
+static char            *send_buffer_ptr;
+static int              send_buffer_fill;
+static value_list_t     send_buffer_vl = VALUE_LIST_STATIC;
+static pthread_mutex_t  send_buffer_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static c_avl_tree_t      *cache_tree = NULL;
+/* In this cache we store all the values we received, so we can send out only
+ * those values which were *not* received via the network plugin, too. This is
+ * used for the `Forward false' option. */
+static c_avl_tree_t    *cache_tree = NULL;
 static pthread_mutex_t  cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static time_t           cache_flush_last = 0;
 static int              cache_flush_interval = 1800;
@@ -296,11 +402,85 @@ static int cache_check (const value_list_t *vl)
 
 	pthread_mutex_unlock (&cache_lock);
 
-	DEBUG ("network plugin: cache_check: key = %s; time = %i; retval = %i",
-			key, (int) vl->time, retval);
-
 	return (retval);
 } /* int cache_check */
+
+#if HAVE_LIBGCRYPT
+static gcry_cipher_hd_t network_get_aes256_cypher (sockent_t *se, /* {{{ */
+    const void *iv, size_t iv_size, const char *username)
+{
+  gcry_error_t err;
+  gcry_cipher_hd_t *cyper_ptr;
+  unsigned char password_hash[32];
+
+  if (se->type == SOCKENT_TYPE_CLIENT)
+  {
+	  cyper_ptr = &se->data.client.cypher;
+	  memcpy (password_hash, se->data.client.password_hash,
+			  sizeof (password_hash));
+  }
+  else
+  {
+	  char *secret;
+
+	  cyper_ptr = &se->data.server.cypher;
+
+	  if (username == NULL)
+		  return (NULL);
+
+	  secret = fbh_get (se->data.server.userdb, username);
+	  if (secret == NULL)
+		  return (NULL);
+
+	  gcry_md_hash_buffer (GCRY_MD_SHA256,
+			  password_hash,
+			  secret, strlen (secret));
+
+	  sfree (secret);
+  }
+
+  if (*cyper_ptr == NULL)
+  {
+    err = gcry_cipher_open (cyper_ptr,
+        GCRY_CIPHER_AES256, GCRY_CIPHER_MODE_OFB, /* flags = */ 0);
+    if (err != 0)
+    {
+      ERROR ("network plugin: gcry_cipher_open returned: %s",
+          gcry_strerror (err));
+      *cyper_ptr = NULL;
+      return (NULL);
+    }
+  }
+  else
+  {
+    gcry_cipher_reset (*cyper_ptr);
+  }
+  assert (*cyper_ptr != NULL);
+
+  err = gcry_cipher_setkey (*cyper_ptr,
+      password_hash, sizeof (password_hash));
+  if (err != 0)
+  {
+    ERROR ("network plugin: gcry_cipher_setkey returned: %s",
+        gcry_strerror (err));
+    gcry_cipher_close (*cyper_ptr);
+    *cyper_ptr = NULL;
+    return (NULL);
+  }
+
+  err = gcry_cipher_setiv (*cyper_ptr, iv, iv_size);
+  if (err != 0)
+  {
+    ERROR ("network plugin: gcry_cipher_setkey returned: %s",
+        gcry_strerror (err));
+    gcry_cipher_close (*cyper_ptr);
+    *cyper_ptr = NULL;
+    return (NULL);
+  }
+
+  return (*cyper_ptr);
+} /* }}} int network_get_aes256_cypher */
+#endif /* HAVE_LIBGCRYPT */
 
 static int write_part_values (char **ret_buffer, int *ret_buffer_len,
 		const data_set_t *ds, const value_list_t *vl)
@@ -458,11 +638,11 @@ static int write_part_string (char **ret_buffer, int *ret_buffer_len,
 	return (0);
 } /* int write_part_string */
 
-static int parse_part_values (void **ret_buffer, int *ret_buffer_len,
+static int parse_part_values (void **ret_buffer, size_t *ret_buffer_len,
 		value_t **ret_values, int *ret_num_values)
 {
 	char *buffer = *ret_buffer;
-	int   buffer_len = *ret_buffer_len;
+	size_t buffer_len = *ret_buffer_len;
 
 	uint16_t tmp16;
 	size_t exp_size;
@@ -475,10 +655,10 @@ static int parse_part_values (void **ret_buffer, int *ret_buffer_len,
 	uint8_t *pkg_types;
 	value_t *pkg_values;
 
-	if (buffer_len < (15))
+	if (buffer_len < 15)
 	{
-		DEBUG ("network plugin: packet is too short: buffer_len = %i",
-				buffer_len);
+		NOTICE ("network plugin: packet is too short: "
+				"buffer_len = %zu", buffer_len);
 		return (-1);
 	}
 
@@ -498,13 +678,13 @@ static int parse_part_values (void **ret_buffer, int *ret_buffer_len,
 
 	exp_size = 3 * sizeof (uint16_t)
 		+ pkg_numval * (sizeof (uint8_t) + sizeof (value_t));
-	if ((buffer_len < 0) || ((size_t) buffer_len < exp_size))
+	if ((buffer_len < 0) || (buffer_len < exp_size))
 	{
 		WARNING ("network plugin: parse_part_values: "
 				"Packet too short: "
-				"Chunk of size %u expected, "
-				"but buffer has only %i bytes left.",
-				(unsigned int) exp_size, buffer_len);
+				"Chunk of size %zu expected, "
+				"but buffer has only %zu bytes left.",
+				exp_size, buffer_len);
 		return (-1);
 	}
 
@@ -549,11 +729,11 @@ static int parse_part_values (void **ret_buffer, int *ret_buffer_len,
 	return (0);
 } /* int parse_part_values */
 
-static int parse_part_number (void **ret_buffer, int *ret_buffer_len,
+static int parse_part_number (void **ret_buffer, size_t *ret_buffer_len,
 		uint64_t *value)
 {
 	char *buffer = *ret_buffer;
-	int buffer_len = *ret_buffer_len;
+	size_t buffer_len = *ret_buffer_len;
 
 	uint16_t tmp16;
 	uint64_t tmp64;
@@ -566,9 +746,9 @@ static int parse_part_number (void **ret_buffer, int *ret_buffer_len,
 	{
 		WARNING ("network plugin: parse_part_number: "
 				"Packet too short: "
-				"Chunk of size %u expected, "
-				"but buffer has only %i bytes left.",
-				(unsigned int) exp_size, buffer_len);
+				"Chunk of size %zu expected, "
+				"but buffer has only %zu bytes left.",
+				exp_size, buffer_len);
 		return (-1);
 	}
 
@@ -590,11 +770,11 @@ static int parse_part_number (void **ret_buffer, int *ret_buffer_len,
 	return (0);
 } /* int parse_part_number */
 
-static int parse_part_string (void **ret_buffer, int *ret_buffer_len,
+static int parse_part_string (void **ret_buffer, size_t *ret_buffer_len,
 		char *output, int output_len)
 {
 	char *buffer = *ret_buffer;
-	int   buffer_len = *ret_buffer_len;
+	size_t buffer_len = *ret_buffer_len;
 
 	uint16_t tmp16;
 	size_t header_size = 2 * sizeof (uint16_t);
@@ -602,13 +782,13 @@ static int parse_part_string (void **ret_buffer, int *ret_buffer_len,
 	uint16_t pkg_length;
 	uint16_t pkg_type;
 
-	if ((buffer_len < 0) || ((size_t) buffer_len < header_size))
+	if ((buffer_len < 0) || (buffer_len < header_size))
 	{
 		WARNING ("network plugin: parse_part_string: "
 				"Packet too short: "
-				"Chunk of at least size %u expected, "
-				"but buffer has only %i bytes left.",
-				(unsigned int) header_size, buffer_len);
+				"Chunk of at least size %zu expected, "
+				"but buffer has only %zu bytes left.",
+				header_size, buffer_len);
 		return (-1);
 	}
 
@@ -625,8 +805,8 @@ static int parse_part_string (void **ret_buffer, int *ret_buffer_len,
 	{
 		WARNING ("network plugin: parse_part_string: "
 				"Packet too big: "
-				"Chunk of size %hu received, "
-				"but buffer has only %i bytes left.",
+				"Chunk of size %"PRIu16" received, "
+				"but buffer has only %zu bytes left.",
 				pkg_length, buffer_len);
 		return (-1);
 	}
@@ -673,22 +853,378 @@ static int parse_part_string (void **ret_buffer, int *ret_buffer_len,
 	return (0);
 } /* int parse_part_string */
 
-static int parse_packet (void *buffer, int buffer_len)
+/* Forward declaration: parse_part_sign_sha256 and parse_part_encr_aes256 call
+ * parse_packet and vice versa. */
+#define PP_SIGNED    0x01
+#define PP_ENCRYPTED 0x02
+static int parse_packet (sockent_t *se,
+		void *buffer, size_t buffer_size, int flags);
+
+#define BUFFER_READ(p,s) do { \
+  memcpy ((p), buffer + buffer_offset, (s)); \
+  buffer_offset += (s); \
+} while (0)
+
+#if HAVE_LIBGCRYPT
+static int parse_part_sign_sha256 (sockent_t *se, /* {{{ */
+    void **ret_buffer, size_t *ret_buffer_len, int flags)
+{
+  char *buffer;
+  size_t buffer_len;
+  size_t buffer_offset;
+
+  size_t username_len;
+  char *secret;
+
+  part_signature_sha256_t pss;
+  uint16_t pss_head_length;
+  char hash[sizeof (pss.hash)];
+
+  gcry_md_hd_t hd;
+  gcry_error_t err;
+  unsigned char *hash_ptr;
+
+  buffer = *ret_buffer;
+  buffer_len = *ret_buffer_len;
+  buffer_offset = 0;
+
+  if (se->data.server.userdb == NULL)
+  {
+    NOTICE ("network plugin: Received signed network packet but can't verify "
+        "it because no user DB has been configured. Will accept it.");
+    return (0);
+  }
+
+  /* Check if the buffer has enough data for this structure. */
+  if (buffer_len <= PART_SIGNATURE_SHA256_SIZE)
+    return (-ENOMEM);
+
+  /* Read type and length header */
+  BUFFER_READ (&pss.head.type, sizeof (pss.head.type));
+  BUFFER_READ (&pss.head.length, sizeof (pss.head.length));
+  pss_head_length = ntohs (pss.head.length);
+
+  /* Check if the `pss_head_length' is within bounds. */
+  if ((pss_head_length <= PART_SIGNATURE_SHA256_SIZE)
+      || (pss_head_length > buffer_len))
+  {
+    ERROR ("network plugin: HMAC-SHA-256 with invalid length received.");
+    return (-1);
+  }
+
+  /* Copy the hash. */
+  BUFFER_READ (pss.hash, sizeof (pss.hash));
+
+  /* Calculate username length (without null byte) and allocate memory */
+  username_len = pss_head_length - PART_SIGNATURE_SHA256_SIZE;
+  pss.username = malloc (username_len + 1);
+  if (pss.username == NULL)
+    return (-ENOMEM);
+
+  /* Read the username */
+  BUFFER_READ (pss.username, username_len);
+  pss.username[username_len] = 0;
+
+  assert (buffer_offset == pss_head_length);
+
+  /* Query the password */
+  secret = fbh_get (se->data.server.userdb, pss.username);
+  if (secret == NULL)
+  {
+    ERROR ("network plugin: Unknown user: %s", pss.username);
+    sfree (pss.username);
+    return (-ENOENT);
+  }
+
+  /* Create a hash device and check the HMAC */
+  hd = NULL;
+  err = gcry_md_open (&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC);
+  if (err != 0)
+  {
+    ERROR ("network plugin: Creating HMAC-SHA-256 object failed: %s",
+        gcry_strerror (err));
+    sfree (secret);
+    sfree (pss.username);
+    return (-1);
+  }
+
+  err = gcry_md_setkey (hd, secret, strlen (secret));
+  if (err != 0)
+  {
+    ERROR ("network plugin: gcry_md_setkey failed: %s", gcry_strerror (err));
+    gcry_md_close (hd);
+    return (-1);
+  }
+
+  gcry_md_write (hd,
+      buffer     + PART_SIGNATURE_SHA256_SIZE,
+      buffer_len - PART_SIGNATURE_SHA256_SIZE);
+  hash_ptr = gcry_md_read (hd, GCRY_MD_SHA256);
+  if (hash_ptr == NULL)
+  {
+    ERROR ("network plugin: gcry_md_read failed.");
+    gcry_md_close (hd);
+    sfree (secret);
+    sfree (pss.username);
+    return (-1);
+  }
+  memcpy (hash, hash_ptr, sizeof (hash));
+
+  /* Clean up */
+  gcry_md_close (hd);
+  hd = NULL;
+
+  sfree (secret);
+  sfree (pss.username);
+
+  if (memcmp (pss.hash, hash, sizeof (pss.hash)) != 0)
+  {
+    WARNING ("network plugin: Verifying HMAC-SHA-256 signature failed: "
+        "Hash mismatch.");
+  }
+  else
+  {
+    parse_packet (se, buffer + buffer_offset, buffer_len - buffer_offset,
+        flags | PP_SIGNED);
+  }
+
+  *ret_buffer = buffer + buffer_len;
+  *ret_buffer_len = 0;
+
+  return (0);
+} /* }}} int parse_part_sign_sha256 */
+/* #endif HAVE_LIBGCRYPT */
+
+#else /* if !HAVE_LIBGCRYPT */
+static int parse_part_sign_sha256 (sockent_t *se, /* {{{ */
+    void **ret_buffer, size_t *ret_buffer_size, int flags)
+{
+  static int warning_has_been_printed = 0;
+
+  char *buffer;
+  size_t buffer_size;
+  size_t buffer_offset;
+  uint16_t part_len;
+
+  part_signature_sha256_t pss;
+
+  buffer = *ret_buffer;
+  buffer_size = *ret_buffer_size;
+  buffer_offset = 0;
+
+  if (buffer_size <= PART_SIGNATURE_SHA256_SIZE)
+    return (-ENOMEM);
+
+  BUFFER_READ (&pss.head.type, sizeof (pss.head.type));
+  BUFFER_READ (&pss.head.length, sizeof (pss.head.length));
+  part_len = ntohs (pss.head.length);
+
+  if ((part_len <= PART_SIGNATURE_SHA256_SIZE)
+      || (part_len > buffer_size))
+    return (-EINVAL);
+
+  if (warning_has_been_printed == 0)
+  {
+    WARNING ("network plugin: Received signed packet, but the network "
+        "plugin was not linked with libgcrypt, so I cannot "
+        "verify the signature. The packet will be accepted.");
+    warning_has_been_printed = 1;
+  }
+
+  parse_packet (se, buffer + part_len, buffer_size - part_len, flags);
+
+  *ret_buffer = buffer + buffer_size;
+  *ret_buffer_size = 0;
+
+  return (0);
+} /* }}} int parse_part_sign_sha256 */
+#endif /* !HAVE_LIBGCRYPT */
+
+#if HAVE_LIBGCRYPT
+static int parse_part_encr_aes256 (sockent_t *se, /* {{{ */
+		void **ret_buffer, size_t *ret_buffer_len,
+		int flags)
+{
+  char  *buffer = *ret_buffer;
+  size_t buffer_len = *ret_buffer_len;
+  size_t payload_len;
+  size_t part_size;
+  size_t buffer_offset;
+  uint16_t username_len;
+  part_encryption_aes256_t pea;
+  unsigned char hash[sizeof (pea.hash)];
+
+  gcry_cipher_hd_t cypher;
+  gcry_error_t err;
+
+  /* Make sure at least the header if available. */
+  if (buffer_len <= PART_ENCRYPTION_AES256_SIZE)
+  {
+    NOTICE ("network plugin: parse_part_encr_aes256: "
+        "Discarding short packet.");
+    return (-1);
+  }
+
+  buffer_offset = 0;
+
+  /* Copy the unencrypted information into `pea'. */
+  BUFFER_READ (&pea.head.type, sizeof (pea.head.type));
+  BUFFER_READ (&pea.head.length, sizeof (pea.head.length));
+
+  /* Check the `part size'. */
+  part_size = ntohs (pea.head.length);
+  if ((part_size <= PART_ENCRYPTION_AES256_SIZE)
+      || (part_size > buffer_len))
+  {
+    NOTICE ("network plugin: parse_part_encr_aes256: "
+        "Discarding part with invalid size.");
+    return (-1);
+  }
+
+  /* Read the username */
+  BUFFER_READ (&username_len, sizeof (username_len));
+  username_len = ntohs (username_len);
+
+  if ((username_len <= 0)
+      || (username_len > (part_size - (PART_ENCRYPTION_AES256_SIZE + 1))))
+  {
+    NOTICE ("network plugin: parse_part_encr_aes256: "
+        "Discarding part with invalid username length.");
+    return (-1);
+  }
+
+  assert (username_len > 0);
+  pea.username = malloc (username_len + 1);
+  if (pea.username == NULL)
+    return (-ENOMEM);
+  BUFFER_READ (pea.username, username_len);
+  pea.username[username_len] = 0;
+
+  /* Last but not least, the initialization vector */
+  BUFFER_READ (pea.iv, sizeof (pea.iv));
+
+  /* Make sure we are at the right position */
+  assert (buffer_offset == (username_len +
+        PART_ENCRYPTION_AES256_SIZE - sizeof (pea.hash)));
+
+  cypher = network_get_aes256_cypher (se, pea.iv, sizeof (pea.iv),
+      pea.username);
+  if (cypher == NULL)
+    return (-1);
+
+  payload_len = part_size - (PART_ENCRYPTION_AES256_SIZE + username_len);
+  assert (payload_len > 0);
+
+  /* Decrypt the packet in-place */
+  err = gcry_cipher_decrypt (cypher,
+      buffer    + buffer_offset,
+      part_size - buffer_offset,
+      /* in = */ NULL, /* in len = */ 0);
+  if (err != 0)
+  {
+    ERROR ("network plugin: gcry_cipher_decrypt returned: %s",
+        gcry_strerror (err));
+    return (-1);
+  }
+
+  /* Read the hash */
+  BUFFER_READ (pea.hash, sizeof (pea.hash));
+
+  /* Make sure we're at the right position - again */
+  assert (buffer_offset == (username_len + PART_ENCRYPTION_AES256_SIZE));
+  assert (buffer_offset == (part_size - payload_len));
+
+  /* Check hash sum */
+  memset (hash, 0, sizeof (hash));
+  gcry_md_hash_buffer (GCRY_MD_SHA1, hash,
+      buffer + buffer_offset, payload_len);
+  if (memcmp (hash, pea.hash, sizeof (hash)) != 0)
+  {
+    ERROR ("network plugin: Decryption failed: Checksum mismatch.");
+    return (-1);
+  }
+
+  parse_packet (se, buffer + buffer_offset, payload_len,
+      flags | PP_ENCRYPTED);
+
+  /* Update return values */
+  *ret_buffer =     buffer     + part_size;
+  *ret_buffer_len = buffer_len - part_size;
+
+  return (0);
+} /* }}} int parse_part_encr_aes256 */
+/* #endif HAVE_LIBGCRYPT */
+
+#else /* if !HAVE_LIBGCRYPT */
+static int parse_part_encr_aes256 (sockent_t *se, /* {{{ */
+    void **ret_buffer, size_t *ret_buffer_size, int flags)
+{
+  static int warning_has_been_printed = 0;
+
+  char *buffer;
+  size_t buffer_size;
+  size_t buffer_offset;
+
+  part_header_t ph;
+  size_t ph_length;
+
+  buffer = *ret_buffer;
+  buffer_size = *ret_buffer_size;
+  buffer_offset = 0;
+
+  /* parse_packet assures this minimum size. */
+  assert (buffer_size >= (sizeof (ph.type) + sizeof (ph.length)));
+
+  BUFFER_READ (&ph.type, sizeof (ph.type));
+  BUFFER_READ (&ph.length, sizeof (ph.length));
+  ph_length = ntohs (ph.length);
+
+  if ((ph_length <= PART_ENCRYPTION_AES256_SIZE)
+      || (ph_length > buffer_size))
+  {
+    ERROR ("network plugin: AES-256 encrypted part "
+        "with invalid length received.");
+    return (-1);
+  }
+
+  if (warning_has_been_printed == 0)
+  {
+    WARNING ("network plugin: Received encrypted packet, but the network "
+        "plugin was not linked with libgcrypt, so I cannot "
+        "decrypt it. The part will be discarded.");
+    warning_has_been_printed = 1;
+  }
+
+  *ret_buffer += ph_length;
+  *ret_buffer_size -= ph_length;
+
+  return (0);
+} /* }}} int parse_part_encr_aes256 */
+#endif /* !HAVE_LIBGCRYPT */
+
+#undef BUFFER_READ
+
+static int parse_packet (sockent_t *se, /* {{{ */
+		void *buffer, size_t buffer_size, int flags)
 {
 	int status;
 
 	value_list_t vl = VALUE_LIST_INIT;
 	notification_t n;
 
-	DEBUG ("network plugin: parse_packet: buffer = %p; buffer_len = %i;",
-			buffer, buffer_len);
+#if HAVE_LIBGCRYPT
+	int packet_was_signed = (flags & PP_SIGNED);
+        int packet_was_encrypted = (flags & PP_ENCRYPTED);
+	int printed_ignore_warning = 0;
+#endif /* HAVE_LIBGCRYPT */
+
 
 	memset (&vl, '\0', sizeof (vl));
 	memset (&n, '\0', sizeof (n));
 	status = 0;
 
-	while ((status == 0) && (0 < buffer_len)
-			&& ((unsigned int) buffer_len > sizeof (part_header_t)))
+	while ((status == 0) && (0 < buffer_size)
+			&& ((unsigned int) buffer_size > sizeof (part_header_t)))
 	{
 		uint16_t pkg_length;
 		uint16_t pkg_type;
@@ -703,15 +1239,68 @@ static int parse_packet (void *buffer, int buffer_len)
 		pkg_length = ntohs (pkg_length);
 		pkg_type = ntohs (pkg_type);
 
-		if (pkg_length > buffer_len)
+		if (pkg_length > buffer_size)
 			break;
 		/* Ensure that this loop terminates eventually */
 		if (pkg_length < (2 * sizeof (uint16_t)))
 			break;
 
-		if (pkg_type == TYPE_VALUES)
+		if (pkg_type == TYPE_ENCR_AES256)
 		{
-			status = parse_part_values (&buffer, &buffer_len,
+			status = parse_part_encr_aes256 (se,
+					&buffer, &buffer_size, flags);
+			if (status != 0)
+			{
+				ERROR ("network plugin: Decrypting AES256 "
+						"part failed "
+						"with status %i.", status);
+				break;
+			}
+		}
+#if HAVE_LIBGCRYPT
+		else if ((se->data.server.security_level == SECURITY_LEVEL_ENCRYPT)
+				&& (packet_was_encrypted == 0))
+		{
+			if (printed_ignore_warning == 0)
+			{
+				INFO ("network plugin: Unencrypted packet or "
+						"part has been ignored.");
+				printed_ignore_warning = 1;
+			}
+			buffer = ((char *) buffer) + pkg_length;
+			continue;
+		}
+#endif /* HAVE_LIBGCRYPT */
+		else if (pkg_type == TYPE_SIGN_SHA256)
+		{
+			status = parse_part_sign_sha256 (se,
+                                        &buffer, &buffer_size, flags);
+			if (status != 0)
+			{
+				ERROR ("network plugin: Verifying HMAC-SHA-256 "
+						"signature failed "
+						"with status %i.", status);
+				break;
+			}
+		}
+#if HAVE_LIBGCRYPT
+		else if ((se->data.server.security_level == SECURITY_LEVEL_SIGN)
+				&& (packet_was_encrypted == 0)
+				&& (packet_was_signed == 0))
+		{
+			if (printed_ignore_warning == 0)
+			{
+				INFO ("network plugin: Unsigned packet or "
+						"part has been ignored.");
+				printed_ignore_warning = 1;
+			}
+			buffer = ((char *) buffer) + pkg_length;
+			continue;
+		}
+#endif /* HAVE_LIBGCRYPT */
+		else if (pkg_type == TYPE_VALUES)
+		{
+			status = parse_part_values (&buffer, &buffer_size,
 					&vl.values, &vl.values_len);
 
 			if (status != 0)
@@ -736,7 +1325,7 @@ static int parse_packet (void *buffer, int buffer_len)
 		else if (pkg_type == TYPE_TIME)
 		{
 			uint64_t tmp = 0;
-			status = parse_part_number (&buffer, &buffer_len,
+			status = parse_part_number (&buffer, &buffer_size,
 					&tmp);
 			if (status == 0)
 			{
@@ -747,21 +1336,21 @@ static int parse_packet (void *buffer, int buffer_len)
 		else if (pkg_type == TYPE_INTERVAL)
 		{
 			uint64_t tmp = 0;
-			status = parse_part_number (&buffer, &buffer_len,
+			status = parse_part_number (&buffer, &buffer_size,
 					&tmp);
 			if (status == 0)
 				vl.interval = (int) tmp;
 		}
 		else if (pkg_type == TYPE_HOST)
 		{
-			status = parse_part_string (&buffer, &buffer_len,
+			status = parse_part_string (&buffer, &buffer_size,
 					vl.host, sizeof (vl.host));
 			if (status == 0)
 				sstrncpy (n.host, vl.host, sizeof (n.host));
 		}
 		else if (pkg_type == TYPE_PLUGIN)
 		{
-			status = parse_part_string (&buffer, &buffer_len,
+			status = parse_part_string (&buffer, &buffer_size,
 					vl.plugin, sizeof (vl.plugin));
 			if (status == 0)
 				sstrncpy (n.plugin, vl.plugin,
@@ -769,7 +1358,7 @@ static int parse_packet (void *buffer, int buffer_len)
 		}
 		else if (pkg_type == TYPE_PLUGIN_INSTANCE)
 		{
-			status = parse_part_string (&buffer, &buffer_len,
+			status = parse_part_string (&buffer, &buffer_size,
 					vl.plugin_instance,
 					sizeof (vl.plugin_instance));
 			if (status == 0)
@@ -779,14 +1368,14 @@ static int parse_packet (void *buffer, int buffer_len)
 		}
 		else if (pkg_type == TYPE_TYPE)
 		{
-			status = parse_part_string (&buffer, &buffer_len,
+			status = parse_part_string (&buffer, &buffer_size,
 					vl.type, sizeof (vl.type));
 			if (status == 0)
 				sstrncpy (n.type, vl.type, sizeof (n.type));
 		}
 		else if (pkg_type == TYPE_TYPE_INSTANCE)
 		{
-			status = parse_part_string (&buffer, &buffer_len,
+			status = parse_part_string (&buffer, &buffer_size,
 					vl.type_instance,
 					sizeof (vl.type_instance));
 			if (status == 0)
@@ -795,7 +1384,7 @@ static int parse_packet (void *buffer, int buffer_len)
 		}
 		else if (pkg_type == TYPE_MESSAGE)
 		{
-			status = parse_part_string (&buffer, &buffer_len,
+			status = parse_part_string (&buffer, &buffer_size,
 					n.message, sizeof (n.message));
 
 			if (status != 0)
@@ -831,7 +1420,7 @@ static int parse_packet (void *buffer, int buffer_len)
 		else if (pkg_type == TYPE_SEVERITY)
 		{
 			uint64_t tmp = 0;
-			status = parse_part_number (&buffer, &buffer_len,
+			status = parse_part_number (&buffer, &buffer_size,
 					&tmp);
 			if (status == 0)
 				n.severity = (int) tmp;
@@ -842,22 +1431,71 @@ static int parse_packet (void *buffer, int buffer_len)
 					" type: 0x%04hx", pkg_type);
 			buffer = ((char *) buffer) + pkg_length;
 		}
-	} /* while (buffer_len > sizeof (part_header_t)) */
+	} /* while (buffer_size > sizeof (part_header_t)) */
 
 	return (status);
-} /* int parse_packet */
+} /* }}} int parse_packet */
 
-static void free_sockent (sockent_t *se)
+static void free_sockent_client (struct sockent_client *sec) /* {{{ */
 {
-	sockent_t *next;
-	while (se != NULL)
-	{
-		next = se->next;
-		free (se->addr);
-		free (se);
-		se = next;
-	}
-} /* void free_sockent */
+  if (sec->fd >= 0)
+  {
+    close (sec->fd);
+    sec->fd = -1;
+  }
+  sfree (sec->addr);
+#if HAVE_LIBGCRYPT
+  sfree (sec->username);
+  sfree (sec->password);
+  if (sec->cypher != NULL)
+    gcry_cipher_close (sec->cypher);
+#endif
+} /* }}} void free_sockent_client */
+
+static void free_sockent_server (struct sockent_server *ses) /* {{{ */
+{
+  size_t i;
+
+  for (i = 0; i < ses->fd_num; i++)
+  {
+    if (ses->fd[i] >= 0)
+    {
+      close (ses->fd[i]);
+      ses->fd[i] = -1;
+    }
+  }
+
+  sfree (ses->fd);
+#if HAVE_LIBGCRYPT
+  sfree (ses->auth_file);
+  fbh_destroy (ses->userdb);
+  if (ses->cypher != NULL)
+    gcry_cipher_close (ses->cypher);
+#endif
+} /* }}} void free_sockent_server */
+
+static void sockent_destroy (sockent_t *se) /* {{{ */
+{
+  sockent_t *next;
+
+  DEBUG ("network plugin: sockent_destroy (se = %p);", (void *) se);
+
+  while (se != NULL)
+  {
+    next = se->next;
+
+    sfree (se->node);
+    sfree (se->service);
+
+    if (se->type == SOCKENT_TYPE_CLIENT)
+      free_sockent_client (&se->data.client);
+    else
+      free_sockent_server (&se->data.server);
+
+    sfree (se);
+    se = next;
+  }
+} /* }}} void sockent_destroy */
 
 /*
  * int network_set_ttl
@@ -870,10 +1508,13 @@ static void free_sockent (sockent_t *se)
  */
 static int network_set_ttl (const sockent_t *se, const struct addrinfo *ai)
 {
+	DEBUG ("network plugin: network_set_ttl: network_config_ttl = %i;",
+			network_config_ttl);
+
+        assert (se->type == SOCKENT_TYPE_CLIENT);
+
 	if ((network_config_ttl < 1) || (network_config_ttl > 255))
 		return (-1);
-
-	DEBUG ("ttl = %i", network_config_ttl);
 
 	if (ai->ai_family == AF_INET)
 	{
@@ -885,7 +1526,7 @@ static int network_set_ttl (const sockent_t *se, const struct addrinfo *ai)
 		else
 			optname = IP_TTL;
 
-		if (setsockopt (se->fd, IPPROTO_IP, optname,
+		if (setsockopt (se->data.client.fd, IPPROTO_IP, optname,
 					&network_config_ttl,
 					sizeof (network_config_ttl)) == -1)
 		{
@@ -906,7 +1547,7 @@ static int network_set_ttl (const sockent_t *se, const struct addrinfo *ai)
 		else
 			optname = IPV6_UNICAST_HOPS;
 
-		if (setsockopt (se->fd, IPPROTO_IPV6, optname,
+		if (setsockopt (se->data.client.fd, IPPROTO_IPV6, optname,
 					&network_config_ttl,
 					sizeof (network_config_ttl)) == -1)
 		{
@@ -921,13 +1562,13 @@ static int network_set_ttl (const sockent_t *se, const struct addrinfo *ai)
 	return (0);
 } /* int network_set_ttl */
 
-static int network_bind_socket (const sockent_t *se, const struct addrinfo *ai)
+static int network_bind_socket (int fd, const struct addrinfo *ai)
 {
 	int loop = 0;
 	int yes  = 1;
 
 	/* allow multiple sockets to use the same PORT number */
-	if (setsockopt(se->fd, SOL_SOCKET, SO_REUSEADDR,
+	if (setsockopt (fd, SOL_SOCKET, SO_REUSEADDR,
 				&yes, sizeof(yes)) == -1) {
                 char errbuf[1024];
                 ERROR ("setsockopt: %s", 
@@ -935,9 +1576,9 @@ static int network_bind_socket (const sockent_t *se, const struct addrinfo *ai)
 		return (-1);
 	}
 
-	DEBUG ("fd = %i; calling `bind'", se->fd);
+	DEBUG ("fd = %i; calling `bind'", fd);
 
-	if (bind (se->fd, ai->ai_addr, ai->ai_addrlen) == -1)
+	if (bind (fd, ai->ai_addr, ai->ai_addrlen) == -1)
 	{
 		char errbuf[1024];
 		ERROR ("bind: %s",
@@ -952,12 +1593,12 @@ static int network_bind_socket (const sockent_t *se, const struct addrinfo *ai)
 		{
 			struct ip_mreq mreq;
 
-			DEBUG ("fd = %i; IPv4 multicast address found", se->fd);
+			DEBUG ("fd = %i; IPv4 multicast address found", fd);
 
 			mreq.imr_multiaddr.s_addr = addr->sin_addr.s_addr;
 			mreq.imr_interface.s_addr = htonl (INADDR_ANY);
 
-			if (setsockopt (se->fd, IPPROTO_IP, IP_MULTICAST_LOOP,
+			if (setsockopt (fd, IPPROTO_IP, IP_MULTICAST_LOOP,
 						&loop, sizeof (loop)) == -1)
 			{
 				char errbuf[1024];
@@ -967,7 +1608,7 @@ static int network_bind_socket (const sockent_t *se, const struct addrinfo *ai)
 				return (-1);
 			}
 
-			if (setsockopt (se->fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+			if (setsockopt (fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
 						&mreq, sizeof (mreq)) == -1)
 			{
 				char errbuf[1024];
@@ -986,7 +1627,7 @@ static int network_bind_socket (const sockent_t *se, const struct addrinfo *ai)
 		{
 			struct ipv6_mreq mreq;
 
-			DEBUG ("fd = %i; IPv6 multicast address found", se->fd);
+			DEBUG ("fd = %i; IPv6 multicast address found", fd);
 
 			memcpy (&mreq.ipv6mr_multiaddr,
 					&addr->sin6_addr,
@@ -1003,7 +1644,7 @@ static int network_bind_socket (const sockent_t *se, const struct addrinfo *ai)
 			 * group on more than one interface.*/
 			mreq.ipv6mr_interface = 0;
 
-			if (setsockopt (se->fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP,
+			if (setsockopt (fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP,
 						&loop, sizeof (loop)) == -1)
 			{
 				char errbuf[1024];
@@ -1013,7 +1654,7 @@ static int network_bind_socket (const sockent_t *se, const struct addrinfo *ai)
 				return (-1);
 			}
 
-			if (setsockopt (se->fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP,
+			if (setsockopt (fd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP,
 						&mreq, sizeof (mreq)) == -1)
 			{
 				char errbuf[1024];
@@ -1028,21 +1669,117 @@ static int network_bind_socket (const sockent_t *se, const struct addrinfo *ai)
 	return (0);
 } /* int network_bind_socket */
 
-static sockent_t *network_create_socket (const char *node,
-		const char *service,
-		int listen)
+/* Initialize a sockent structure. `type' must be either `SOCKENT_TYPE_CLIENT'
+ * or `SOCKENT_TYPE_SERVER' */
+static int sockent_init (sockent_t *se, int type) /* {{{ */
+{
+	if (se == NULL)
+		return (-1);
+
+	memset (se, 0, sizeof (*se));
+
+	se->type = SOCKENT_TYPE_CLIENT;
+	se->node = NULL;
+	se->service = NULL;
+	se->next = NULL;
+
+	if (type == SOCKENT_TYPE_SERVER)
+	{
+		se->type = SOCKENT_TYPE_SERVER;
+		se->data.server.fd = NULL;
+#if HAVE_LIBGCRYPT
+		se->data.server.security_level = SECURITY_LEVEL_NONE;
+		se->data.server.auth_file = NULL;
+		se->data.server.userdb = NULL;
+		se->data.server.cypher = NULL;
+#endif
+	}
+	else
+	{
+		se->data.client.fd = -1;
+		se->data.client.addr = NULL;
+#if HAVE_LIBGCRYPT
+		se->data.client.security_level = SECURITY_LEVEL_NONE;
+		se->data.client.username = NULL;
+		se->data.client.password = NULL;
+		se->data.client.cypher = NULL;
+#endif
+	}
+
+	return (0);
+} /* }}} int sockent_init */
+
+/* Open the file descriptors for a initialized sockent structure. */
+static int sockent_open (sockent_t *se) /* {{{ */
 {
 	struct addrinfo  ai_hints;
 	struct addrinfo *ai_list, *ai_ptr;
 	int              ai_return;
 
-	sockent_t *se_head = NULL;
-	sockent_t *se_tail = NULL;
+        const char *node;
+        const char *service;
 
-	DEBUG ("node = %s, service = %s", node, service);
+	if (se == NULL)
+		return (-1);
 
-	memset (&ai_hints, '\0', sizeof (ai_hints));
-	ai_hints.ai_flags    = 0;
+	/* Set up the security structures. */
+#if HAVE_LIBGCRYPT /* {{{ */
+	if (se->type == SOCKENT_TYPE_CLIENT)
+	{
+		if (se->data.client.security_level > SECURITY_LEVEL_NONE)
+		{
+			if ((se->data.client.username == NULL)
+					|| (se->data.client.password == NULL))
+			{
+				ERROR ("network plugin: Client socket with "
+						"security requested, but no "
+						"credentials are configured.");
+				return (-1);
+			}
+			gcry_md_hash_buffer (GCRY_MD_SHA256,
+					se->data.client.password_hash,
+					se->data.client.password,
+					strlen (se->data.client.password));
+		}
+	}
+	else /* (se->type == SOCKENT_TYPE_SERVER) */
+	{
+		if (se->data.server.security_level > SECURITY_LEVEL_NONE)
+		{
+			if (se->data.server.auth_file == NULL)
+			{
+				ERROR ("network plugin: Server socket with "
+						"security requested, but no "
+						"password file is configured.");
+				return (-1);
+			}
+		}
+		if (se->data.server.auth_file != NULL)
+		{
+			se->data.server.userdb = fbh_create (se->data.server.auth_file);
+			if (se->data.server.userdb == NULL)
+			{
+				ERROR ("network plugin: Reading password file "
+						"`%s' failed.",
+						se->data.server.auth_file);
+				if (se->data.server.security_level > SECURITY_LEVEL_NONE)
+					return (-1);
+			}
+		}
+	}
+#endif /* }}} HAVE_LIBGCRYPT */
+
+        node = se->node;
+        service = se->service;
+
+        if (service == NULL)
+          service = NET_DEFAULT_PORT;
+
+        DEBUG ("network plugin: sockent_open: node = %s; service = %s;",
+            node, service);
+
+	memset (&ai_hints, 0, sizeof (ai_hints));
+	ai_hints.ai_flags  = 0;
 #ifdef AI_PASSIVE
 	ai_hints.ai_flags |= AI_PASSIVE;
 #endif
@@ -1056,196 +1793,170 @@ static sockent_t *network_create_socket (const char *node,
 	ai_return = getaddrinfo (node, service, &ai_hints, &ai_list);
 	if (ai_return != 0)
 	{
-		char errbuf[1024];
-		ERROR ("getaddrinfo (%s, %s): %s",
-				(node == NULL) ? "(null)" : node,
-				(service == NULL) ? "(null)" : service,
-				(ai_return == EAI_SYSTEM)
-				? sstrerror (errno, errbuf, sizeof (errbuf))
-				: gai_strerror (ai_return));
-		return (NULL);
+		ERROR ("network plugin: getaddrinfo (%s, %s) failed: %s",
+				(se->node == NULL) ? "(null)" : se->node,
+				(se->service == NULL) ? "(null)" : se->service,
+				gai_strerror (ai_return));
+		return (-1);
 	}
 
 	for (ai_ptr = ai_list; ai_ptr != NULL; ai_ptr = ai_ptr->ai_next)
 	{
-		sockent_t *se;
+		int status;
 
-		if ((se = (sockent_t *) malloc (sizeof (sockent_t))) == NULL)
+		if (se->type == SOCKENT_TYPE_SERVER) /* {{{ */
 		{
-			char errbuf[1024];
-			ERROR ("malloc: %s",
-					sstrerror (errno, errbuf,
-						sizeof (errbuf)));
-			continue;
-		}
+			int *tmp;
 
-		if ((se->addr = (struct sockaddr_storage *) malloc (sizeof (struct sockaddr_storage))) == NULL)
-		{
-			char errbuf[1024];
-			ERROR ("malloc: %s",
-					sstrerror (errno, errbuf,
-						sizeof (errbuf)));
-			free (se);
-			continue;
-		}
-
-		assert (sizeof (struct sockaddr_storage) >= ai_ptr->ai_addrlen);
-		memset (se->addr, '\0', sizeof (struct sockaddr_storage));
-		memcpy (se->addr, ai_ptr->ai_addr, ai_ptr->ai_addrlen);
-		se->addrlen = ai_ptr->ai_addrlen;
-
-		se->fd   = socket (ai_ptr->ai_family,
-				ai_ptr->ai_socktype,
-				ai_ptr->ai_protocol);
-		se->next = NULL;
-
-		if (se->fd == -1)
-		{
-			char errbuf[1024];
-			ERROR ("socket: %s",
-					sstrerror (errno, errbuf,
-						sizeof (errbuf)));
-			free (se->addr);
-			free (se);
-			continue;
-		}
-
-		if (listen != 0)
-		{
-			if (network_bind_socket (se, ai_ptr) != 0)
+			tmp = realloc (se->data.server.fd,
+					sizeof (*tmp) * (se->data.server.fd_num + 1));
+			if (tmp == NULL)
 			{
-				close (se->fd);
-				free (se->addr);
-				free (se);
+				ERROR ("network plugin: realloc failed.");
 				continue;
 			}
-		}
-		else /* listen == 0 */
+			se->data.server.fd = tmp;
+			tmp = se->data.server.fd + se->data.server.fd_num;
+
+			*tmp = socket (ai_ptr->ai_family, ai_ptr->ai_socktype,
+					ai_ptr->ai_protocol);
+			if (*tmp < 0)
+			{
+				char errbuf[1024];
+				ERROR ("network plugin: socket(2) failed: %s",
+						sstrerror (errno, errbuf,
+							sizeof (errbuf)));
+				continue;
+			}
+
+			status = network_bind_socket (*tmp, ai_ptr);
+			if (status != 0)
+			{
+				close (*tmp);
+				*tmp = -1;
+				continue;
+			}
+
+			se->data.server.fd_num++;
+			continue;
+		} /* }}} if (se->type == SOCKENT_TYPE_SERVER) */
+		else /* if (se->type == SOCKENT_TYPE_CLIENT) {{{ */
 		{
+			se->data.client.fd = socket (ai_ptr->ai_family,
+					ai_ptr->ai_socktype,
+					ai_ptr->ai_protocol);
+			if (se->data.client.fd < 0)
+			{
+				char errbuf[1024];
+				ERROR ("network plugin: socket(2) failed: %s",
+						sstrerror (errno, errbuf,
+							sizeof (errbuf)));
+				continue;
+			}
+
+			se->data.client.addr = malloc (sizeof (*se->data.client.addr));
+			if (se->data.client.addr == NULL)
+			{
+				ERROR ("network plugin: malloc failed.");
+				close (se->data.client.fd);
+				se->data.client.fd = -1;
+				continue;
+			}
+
+			memset (se->data.client.addr, 0, sizeof (*se->data.client.addr));
+			assert (sizeof (*se->data.client.addr) >= ai_ptr->ai_addrlen);
+			memcpy (se->data.client.addr, ai_ptr->ai_addr, ai_ptr->ai_addrlen);
+			se->data.client.addrlen = ai_ptr->ai_addrlen;
+
 			network_set_ttl (se, ai_ptr);
-		}
 
-		if (se_tail == NULL)
-		{
-			se_head = se;
-			se_tail = se;
-		}
-		else
-		{
-			se_tail->next = se;
-			se_tail = se;
-		}
-
-		/* We don't open more than one write-socket per node/service pair.. */
-		if (listen == 0)
+			/* We don't open more than one write-socket per
+			 * node/service pair.. */
 			break;
-	}
+		} /* }}} if (se->type == SOCKENT_TYPE_CLIENT) */
+	} /* for (ai_list) */
 
 	freeaddrinfo (ai_list);
 
-	return (se_head);
-} /* sockent_t *network_create_socket */
-
-static sockent_t *network_create_default_socket (int listen)
-{
-	sockent_t *se_ptr  = NULL;
-	sockent_t *se_head = NULL;
-	sockent_t *se_tail = NULL;
-
-	se_ptr = network_create_socket (NET_DEFAULT_V6_ADDR,
-			NET_DEFAULT_PORT, listen);
-
-	/* Don't send to the same machine in IPv6 and IPv4 if both are available. */
-	if ((listen == 0) && (se_ptr != NULL))
-		return (se_ptr);
-
-	if (se_ptr != NULL)
+	/* Check if all went well. */
+	if (se->type == SOCKENT_TYPE_SERVER)
 	{
-		se_head = se_ptr;
-		se_tail = se_ptr;
-		while (se_tail->next != NULL)
-			se_tail = se_tail->next;
+		if (se->data.server.fd_num <= 0)
+			return (-1);
+	}
+	else /* if (se->type == SOCKENT_TYPE_CLIENT) */
+	{
+		if (se->data.client.fd < 0)
+			return (-1);
 	}
 
-	se_ptr = network_create_socket (NET_DEFAULT_V4_ADDR, NET_DEFAULT_PORT, listen);
+	return (0);
+} /* }}} int sockent_open */
 
-	if (se_tail == NULL)
-		return (se_ptr);
-
-	se_tail->next = se_ptr;
-	return (se_head);
-} /* sockent_t *network_create_default_socket */
-
-static int network_add_listen_socket (const char *node, const char *service)
+/* Add a sockent to the global list of sockets */
+static int sockent_add (sockent_t *se) /* {{{ */
 {
-	sockent_t *se;
-	sockent_t *se_ptr;
-	int se_num = 0;
-
-	if (service == NULL)
-		service = NET_DEFAULT_PORT;
-
-	if (node == NULL)
-		se = network_create_default_socket (1 /* listen == true */);
-	else
-		se = network_create_socket (node, service, 1 /* listen == true */);
+	sockent_t *last_ptr;
 
 	if (se == NULL)
 		return (-1);
 
-	for (se_ptr = se; se_ptr != NULL; se_ptr = se_ptr->next)
-		se_num++;
-
-	listen_sockets = (struct pollfd *) realloc (listen_sockets,
-			(listen_sockets_num + se_num)
-			* sizeof (struct pollfd));
-
-	for (se_ptr = se; se_ptr != NULL; se_ptr = se_ptr->next)
+	if (se->type == SOCKENT_TYPE_SERVER)
 	{
-		listen_sockets[listen_sockets_num].fd = se_ptr->fd;
-		listen_sockets[listen_sockets_num].events = POLLIN | POLLPRI;
-		listen_sockets[listen_sockets_num].revents = 0;
-		listen_sockets_num++;
-	} /* for (se) */
+		struct pollfd *tmp;
+		size_t i;
 
-	free_sockent (se);
-	return (0);
-} /* int network_add_listen_socket */
+		tmp = realloc (listen_sockets_pollfd,
+				sizeof (*tmp) * (listen_sockets_num
+					+ se->data.server.fd_num));
+		if (tmp == NULL)
+		{
+			ERROR ("network plugin: realloc failed.");
+			return (-1);
+		}
+		listen_sockets_pollfd = tmp;
+		tmp = listen_sockets_pollfd + listen_sockets_num;
 
-static int network_add_sending_socket (const char *node, const char *service)
-{
-	sockent_t *se;
-	sockent_t *se_ptr;
+		for (i = 0; i < se->data.server.fd_num; i++)
+		{
+			memset (tmp + i, 0, sizeof (*tmp));
+			tmp[i].fd = se->data.server.fd[i];
+			tmp[i].events = POLLIN | POLLPRI;
+			tmp[i].revents = 0;
+		}
 
-	if (service == NULL)
-		service = NET_DEFAULT_PORT;
+		listen_sockets_num += se->data.server.fd_num;
 
-	if (node == NULL)
-		se = network_create_default_socket (0 /* listen == false */);
-	else
-		se = network_create_socket (node, service, 0 /* listen == false */);
-
-	if (se == NULL)
-		return (-1);
-
-	if (sending_sockets == NULL)
+		if (listen_sockets == NULL)
+		{
+			listen_sockets = se;
+			return (0);
+		}
+		last_ptr = listen_sockets;
+	}
+	else /* if (se->type == SOCKENT_TYPE_CLIENT) */
 	{
-		sending_sockets = se;
-		return (0);
+		if (sending_sockets == NULL)
+		{
+			sending_sockets = se;
+			return (0);
+		}
+		last_ptr = sending_sockets;
 	}
 
-	for (se_ptr = sending_sockets; se_ptr->next != NULL; se_ptr = se_ptr->next)
-		/* seek end */;
+	while (last_ptr->next != NULL)
+		last_ptr = last_ptr->next;
+	last_ptr->next = se;
 
-	se_ptr->next = se;
 	return (0);
-} /* int network_get_listen_socket */
+} /* }}} int sockent_add */
 
-static void *dispatch_thread (void __attribute__((unused)) *arg)
+static void *dispatch_thread (void __attribute__((unused)) *arg) /* {{{ */
 {
   while (42)
   {
     receive_list_entry_t *ent;
+    sockent_t *se;
 
     /* Lock and wait for more data to come in */
     pthread_mutex_lock (&receive_list_lock);
@@ -1264,15 +1975,39 @@ static void *dispatch_thread (void __attribute__((unused)) *arg)
     if (ent == NULL)
       break;
 
-    parse_packet (ent->data, ent->data_len);
+    /* Look for the correct `sockent_t' */
+    se = listen_sockets;
+    while (se != NULL)
+    {
+      size_t i;
 
+      for (i = 0; i < se->data.server.fd_num; i++)
+        if (se->data.server.fd[i] == ent->fd)
+          break;
+
+      if (i < se->data.server.fd_num)
+        break;
+
+      se = se->next;
+    }
+
+    if (se == NULL)
+    {
+	    ERROR ("network plugin: Got packet from FD %i, but can't "
+			    "find an appropriate socket entry.",
+			    ent->fd);
+	    sfree (ent);
+	    continue;
+    }
+
+    parse_packet (se, ent->data, ent->data_len, /* flags = */ 0);
     sfree (ent);
   } /* while (42) */
 
   return (NULL);
-} /* void *receive_thread */
+} /* }}} void *dispatch_thread */
 
-static int network_receive (void)
+static int network_receive (void) /* {{{ */
 {
 	char buffer[BUFF_SIZE];
 	int  buffer_len;
@@ -1283,21 +2018,14 @@ static int network_receive (void)
 	receive_list_entry_t *private_list_head;
 	receive_list_entry_t *private_list_tail;
 
-	if (listen_sockets_num == 0)
-		network_add_listen_socket (NULL, NULL);
-
-	if (listen_sockets_num == 0)
-	{
-		ERROR ("network: Failed to open a listening socket.");
-		return (-1);
-	}
+        assert (listen_sockets_num > 0);
 
 	private_list_head = NULL;
 	private_list_tail = NULL;
 
 	while (listen_loop == 0)
 	{
-		status = poll (listen_sockets, listen_sockets_num, -1);
+		status = poll (listen_sockets_pollfd, listen_sockets_num, -1);
 
 		if (status <= 0)
 		{
@@ -1313,11 +2041,12 @@ static int network_receive (void)
 		{
 			receive_list_entry_t *ent;
 
-			if ((listen_sockets[i].revents & (POLLIN | POLLPRI)) == 0)
+			if ((listen_sockets_pollfd[i].revents
+						& (POLLIN | POLLPRI)) == 0)
 				continue;
 			status--;
 
-			buffer_len = recv (listen_sockets[i].fd,
+			buffer_len = recv (listen_sockets_pollfd[i].fd,
 					buffer, sizeof (buffer),
 					0 /* no flags */);
 			if (buffer_len < 0)
@@ -1329,6 +2058,10 @@ static int network_receive (void)
 				return (-1);
 			}
 
+			/* TODO: Possible performance enhancement: Do not free
+			 * these entries in the dispatch thread but put them in
+			 * another list, so we don't have to allocate more and
+			 * more of these structures. */
 			ent = malloc (sizeof (receive_list_entry_t));
 			if (ent == NULL)
 			{
@@ -1336,6 +2069,7 @@ static int network_receive (void)
 				return (-1);
 			}
 			memset (ent, 0, sizeof (receive_list_entry_t));
+			ent->fd = listen_sockets_pollfd[i].fd;
 			ent->next = NULL;
 
 			/* Hopefully this be optimized out by the compiler. It
@@ -1368,7 +2102,7 @@ static int network_receive (void)
 				pthread_cond_signal (&receive_list_cond);
 				pthread_mutex_unlock (&receive_list_lock);
 			}
-		} /* for (listen_sockets) */
+		} /* for (listen_sockets_pollfd) */
 	} /* while (listen_loop == 0) */
 
 	/* Make sure everything is dispatched before exiting. */
@@ -1390,43 +2124,233 @@ static int network_receive (void)
 	}
 
 	return (0);
-}
+} /* }}} int network_receive */
 
 static void *receive_thread (void __attribute__((unused)) *arg)
 {
 	return (network_receive () ? (void *) 1 : (void *) 0);
 } /* void *receive_thread */
 
-static void network_send_buffer (const char *buffer, int buffer_len)
+static void network_init_buffer (void)
 {
-	sockent_t *se;
+	memset (send_buffer, 0, sizeof (send_buffer));
+	send_buffer_ptr = send_buffer;
+	send_buffer_fill = 0;
+
+	memset (&send_buffer_vl, 0, sizeof (send_buffer_vl));
+} /* int network_init_buffer */
+
+static void networt_send_buffer_plain (const sockent_t *se, /* {{{ */
+		const char *buffer, size_t buffer_size)
+{
 	int status;
 
-	DEBUG ("network plugin: network_send_buffer: buffer_len = %i", buffer_len);
-
-	for (se = sending_sockets; se != NULL; se = se->next)
+	while (42)
 	{
-		while (42)
+		status = sendto (se->data.client.fd, buffer, buffer_size,
+                    /* flags = */ 0,
+                    (struct sockaddr *) se->data.client.addr,
+                    se->data.client.addrlen);
+                if (status < 0)
 		{
-			status = sendto (se->fd, buffer, buffer_len, 0 /* no flags */,
-					(struct sockaddr *) se->addr, se->addrlen);
-			if (status < 0)
-			{
-				char errbuf[1024];
-				if (errno == EINTR)
-					continue;
-				ERROR ("network plugin: sendto failed: %s",
-						sstrerror (errno, errbuf,
-							sizeof (errbuf)));
-				break;
-			}
-
+			char errbuf[1024];
+			if (errno == EINTR)
+				continue;
+			ERROR ("network plugin: sendto failed: %s",
+					sstrerror (errno, errbuf,
+						sizeof (errbuf)));
 			break;
-		} /* while (42) */
-	} /* for (sending_sockets) */
-} /* void network_send_buffer */
+		}
 
-static int add_to_buffer (char *buffer, int buffer_size,
+		break;
+	} /* while (42) */
+} /* }}} void networt_send_buffer_plain */
+
+#if HAVE_LIBGCRYPT
+#define BUFFER_ADD(p,s) do { \
+  memcpy (buffer + buffer_offset, (p), (s)); \
+  buffer_offset += (s); \
+} while (0)
+
+static void networt_send_buffer_signed (const sockent_t *se, /* {{{ */
+		const char *in_buffer, size_t in_buffer_size)
+{
+  part_signature_sha256_t ps;
+  char buffer[BUFF_SIG_SIZE + in_buffer_size];
+  size_t buffer_offset;
+  size_t username_len;
+
+  gcry_md_hd_t hd;
+  gcry_error_t err;
+  unsigned char *hash;
+
+  hd = NULL;
+  err = gcry_md_open (&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC);
+  if (err != 0)
+  {
+    ERROR ("network plugin: Creating HMAC object failed: %s",
+        gcry_strerror (err));
+    return;
+  }
+
+  err = gcry_md_setkey (hd, se->data.client.password,
+      strlen (se->data.client.password));
+  if (err != 0)
+  {
+    ERROR ("network plugin: gcry_md_setkey failed: %s",
+        gcry_strerror (err));
+    gcry_md_close (hd);
+    return;
+  }
+
+  username_len = strlen (se->data.client.username);
+  if (username_len > (BUFF_SIG_SIZE - PART_SIGNATURE_SHA256_SIZE))
+  {
+    ERROR ("network plugin: Username too long: %s",
+        se->data.client.username);
+    return;
+  }
+
+  memcpy (buffer + PART_SIGNATURE_SHA256_SIZE,
+      se->data.client.username, username_len);
+  memcpy (buffer + PART_SIGNATURE_SHA256_SIZE + username_len,
+      in_buffer, in_buffer_size);
+
+  /* Initialize the `ps' structure. */
+  memset (&ps, 0, sizeof (ps));
+  ps.head.type = htons (TYPE_SIGN_SHA256);
+  ps.head.length = htons (PART_SIGNATURE_SHA256_SIZE + username_len);
+
+  /* Calculate the hash value. */
+  gcry_md_write (hd, buffer + PART_SIGNATURE_SHA256_SIZE,
+      username_len + in_buffer_size);
+  hash = gcry_md_read (hd, GCRY_MD_SHA256);
+  if (hash == NULL)
+  {
+    ERROR ("network plugin: gcry_md_read failed.");
+    gcry_md_close (hd);
+    return;
+  }
+  memcpy (ps.hash, hash, sizeof (ps.hash));
+
+  /* Add the header */
+  buffer_offset = 0;
+
+  BUFFER_ADD (&ps.head.type, sizeof (ps.head.type));
+  BUFFER_ADD (&ps.head.length, sizeof (ps.head.length));
+  BUFFER_ADD (ps.hash, sizeof (ps.hash));
+
+  assert (buffer_offset == PART_SIGNATURE_SHA256_SIZE);
+
+  gcry_md_close (hd);
+  hd = NULL;
+
+  buffer_offset = PART_SIGNATURE_SHA256_SIZE + username_len + in_buffer_size;
+  networt_send_buffer_plain (se, buffer, buffer_offset);
+} /* }}} void networt_send_buffer_signed */
+
+static void networt_send_buffer_encrypted (sockent_t *se, /* {{{ */
+		const char *in_buffer, size_t in_buffer_size)
+{
+  part_encryption_aes256_t pea;
+  char buffer[BUFF_SIG_SIZE + in_buffer_size];
+  size_t buffer_size;
+  size_t buffer_offset;
+  size_t header_size;
+  size_t username_len;
+  gcry_error_t err;
+  gcry_cipher_hd_t cypher;
+
+  /* Initialize the header fields */
+  memset (&pea, 0, sizeof (pea));
+  pea.head.type = htons (TYPE_ENCR_AES256);
+
+  pea.username = se->data.client.username;
+
+  username_len = strlen (pea.username);
+  if ((PART_ENCRYPTION_AES256_SIZE + username_len) > BUFF_SIG_SIZE)
+  {
+    ERROR ("network plugin: Username too long: %s", pea.username);
+    return;
+  }
+
+  buffer_size = PART_ENCRYPTION_AES256_SIZE + username_len + in_buffer_size;
+  header_size = PART_ENCRYPTION_AES256_SIZE + username_len
+    - sizeof (pea.hash);
+
+  assert (buffer_size <= sizeof (buffer));
+  DEBUG ("network plugin: networt_send_buffer_encrypted: "
+      "buffer_size = %zu;", buffer_size);
+
+  pea.head.length = htons ((uint16_t) (PART_ENCRYPTION_AES256_SIZE
+        + username_len + in_buffer_size));
+  pea.username_length = htons ((uint16_t) username_len);
+
+  /* Chose a random initialization vector. */
+  gcry_randomize ((void *) &pea.iv, sizeof (pea.iv), GCRY_STRONG_RANDOM);
+
+  /* Create hash of the payload */
+  gcry_md_hash_buffer (GCRY_MD_SHA1, pea.hash, in_buffer, in_buffer_size);
+
+  /* Initialize the buffer */
+  buffer_offset = 0;
+  memset (buffer, 0, sizeof (buffer));
+
+
+  BUFFER_ADD (&pea.head.type, sizeof (pea.head.type));
+  BUFFER_ADD (&pea.head.length, sizeof (pea.head.length));
+  BUFFER_ADD (&pea.username_length, sizeof (pea.username_length));
+  BUFFER_ADD (pea.username, username_len);
+  BUFFER_ADD (pea.iv, sizeof (pea.iv));
+  assert (buffer_offset == header_size);
+  BUFFER_ADD (pea.hash, sizeof (pea.hash));
+  BUFFER_ADD (in_buffer, in_buffer_size);
+
+  assert (buffer_offset == buffer_size);
+
+  cypher = network_get_aes256_cypher (se, pea.iv, sizeof (pea.iv),
+      se->data.client.password);
+  if (cypher == NULL)
+    return;
+
+  /* Encrypt the buffer in-place */
+  err = gcry_cipher_encrypt (cypher,
+      buffer      + header_size,
+      buffer_size - header_size,
+      /* in = */ NULL, /* in len = */ 0);
+  if (err != 0)
+  {
+    ERROR ("network plugin: gcry_cipher_encrypt returned: %s",
+        gcry_strerror (err));
+    return;
+  }
+
+  /* Send it out without further modifications */
+  networt_send_buffer_plain (se, buffer, buffer_size);
+} /* }}} void networt_send_buffer_encrypted */
+#undef BUFFER_ADD
+#endif /* HAVE_LIBGCRYPT */
+
+static void network_send_buffer (char *buffer, size_t buffer_len) /* {{{ */
+{
+  sockent_t *se;
+
+  DEBUG ("network plugin: network_send_buffer: buffer_len = %zu", buffer_len);
+
+  for (se = sending_sockets; se != NULL; se = se->next)
+  {
+#if HAVE_LIBGCRYPT
+    if (se->data.client.security_level == SECURITY_LEVEL_ENCRYPT)
+      networt_send_buffer_encrypted (se, buffer, buffer_len);
+    else if (se->data.client.security_level == SECURITY_LEVEL_SIGN)
+      networt_send_buffer_signed (se, buffer, buffer_len);
+    else /* if (se->data.client.security_level == SECURITY_LEVEL_NONE) */
+#endif /* HAVE_LIBGCRYPT */
+      networt_send_buffer_plain (se, buffer, buffer_len);
+  } /* for (sending_sockets) */
+} /* }}} void network_send_buffer */
+
+static int add_to_buffer (char *buffer, int buffer_size, /* {{{ */
 		value_list_t *vl_def,
 		const data_set_t *ds, const value_list_t *vl)
 {
@@ -1494,20 +2418,19 @@ static int add_to_buffer (char *buffer, int buffer_size,
 		return (-1);
 
 	return (buffer - buffer_orig);
-} /* int add_to_buffer */
+} /* }}} int add_to_buffer */
 
 static void flush_buffer (void)
 {
 	DEBUG ("network plugin: flush_buffer: send_buffer_fill = %i",
 			send_buffer_fill);
 
-	network_send_buffer (send_buffer, send_buffer_fill);
-	send_buffer_ptr  = send_buffer;
-	send_buffer_fill = 0;
-	memset (&send_buffer_vl, 0, sizeof (send_buffer_vl));
+	network_send_buffer (send_buffer, (size_t) send_buffer_fill);
+	network_init_buffer ();
 }
 
-static int network_write (const data_set_t *ds, const value_list_t *vl)
+static int network_write (const data_set_t *ds, const value_list_t *vl,
+		user_data_t __attribute__((unused)) *user_data)
 {
 	int status;
 
@@ -1522,7 +2445,7 @@ static int network_write (const data_set_t *ds, const value_list_t *vl)
 	pthread_mutex_lock (&send_buffer_lock);
 
 	status = add_to_buffer (send_buffer_ptr,
-			sizeof (send_buffer) - send_buffer_fill,
+			sizeof (send_buffer) - (send_buffer_fill + BUFF_SIG_SIZE),
 			&send_buffer_vl,
 			ds, vl);
 	if (status >= 0)
@@ -1536,7 +2459,7 @@ static int network_write (const data_set_t *ds, const value_list_t *vl)
 		flush_buffer ();
 
 		status = add_to_buffer (send_buffer_ptr,
-				sizeof (send_buffer) - send_buffer_fill,
+				sizeof (send_buffer) - (send_buffer_fill + BUFF_SIG_SIZE),
 				&send_buffer_vl,
 				ds, vl);
 
@@ -1562,76 +2485,324 @@ static int network_write (const data_set_t *ds, const value_list_t *vl)
 	return ((status < 0) ? -1 : 0);
 } /* int network_write */
 
-static int network_config (const char *key, const char *val)
+static int network_config_set_boolean (const oconfig_item_t *ci, /* {{{ */
+    int *retval)
 {
-	char *node;
-	char *service;
+  if ((ci->values_num != 1)
+      || ((ci->values[0].type != OCONFIG_TYPE_BOOLEAN)
+        && (ci->values[0].type != OCONFIG_TYPE_STRING)))
+  {
+    ERROR ("network plugin: The `%s' config option needs "
+        "exactly one boolean argument.", ci->key);
+    return (-1);
+  }
 
-	char *fields[3];
-	int   fields_num;
+  if (ci->values[0].type == OCONFIG_TYPE_BOOLEAN)
+  {
+    if (ci->values[0].value.boolean)
+      *retval = 1;
+    else
+      *retval = 0;
+  }
+  else
+  {
+    char *str = ci->values[0].value.string;
 
-	if ((strcasecmp ("Listen", key) == 0)
-			|| (strcasecmp ("Server", key) == 0))
-	{
-		char *val_cpy = strdup (val);
-		if (val_cpy == NULL)
-			return (1);
+    if ((strcasecmp ("true", str) == 0)
+        || (strcasecmp ("yes", str) == 0)
+        || (strcasecmp ("on", str) == 0))
+      *retval = 1;
+    else if ((strcasecmp ("false", str) == 0)
+        || (strcasecmp ("no", str) == 0)
+        || (strcasecmp ("off", str) == 0))
+      *retval = 0;
+    else
+    {
+      ERROR ("network plugin: Cannot parse string value `%s' of the `%s' "
+          "option as boolean value.",
+          str, ci->key);
+      return (-1);
+    }
+  }
 
-		service = NET_DEFAULT_PORT;
-		fields_num = strsplit (val_cpy, fields, 3);
-		if ((fields_num != 1)
-				&& (fields_num != 2))
-		{
-			sfree (val_cpy);
-			return (1);
-		}
-		else if (fields_num == 2)
-		{
-			if ((service = strchr (fields[1], '.')) != NULL)
-				*service = '\0';
-			service = fields[1];
-		}
-		node = fields[0];
+  return (0);
+} /* }}} int network_config_set_boolean */
 
-		if (strcasecmp ("Listen", key) == 0)
-			network_add_listen_socket (node, service);
-		else
-			network_add_sending_socket (node, service);
+static int network_config_set_ttl (const oconfig_item_t *ci) /* {{{ */
+{
+  int tmp;
+  if ((ci->values_num != 1)
+      || (ci->values[0].type != OCONFIG_TYPE_NUMBER))
+  {
+    WARNING ("network plugin: The `TimeToLive' config option needs exactly "
+        "one numeric argument.");
+    return (-1);
+  }
 
-		sfree (val_cpy);
-	}
-	else if (strcasecmp ("TimeToLive", key) == 0)
-	{
-		int tmp = atoi (val);
-		if ((tmp > 0) && (tmp < 256))
-			network_config_ttl = tmp;
-		else
-			return (1);
-	}
-	else if (strcasecmp ("Forward", key) == 0)
-	{
-		if ((strcasecmp ("true", val) == 0)
-				|| (strcasecmp ("yes", val) == 0)
-				|| (strcasecmp ("on", val) == 0))
-			network_config_forward = 1;
-		else
-			network_config_forward = 0;
-	}
-	else if (strcasecmp ("CacheFlush", key) == 0)
-	{
-		int tmp = atoi (val);
-		if (tmp > 0)
-			cache_flush_interval = tmp;
-		else return (1);
-	}
-	else
-	{
-		return (-1);
-	}
-	return (0);
-} /* int network_config */
+  tmp = (int) ci->values[0].value.number;
+  if ((tmp > 0) && (tmp <= 255))
+    network_config_ttl = tmp;
 
-static int network_notification (const notification_t *n)
+  return (0);
+} /* }}} int network_config_set_ttl */
+
+#if HAVE_LIBGCRYPT
+static int network_config_set_string (const oconfig_item_t *ci, /* {{{ */
+    char **ret_string)
+{
+  char *tmp;
+  if ((ci->values_num != 1)
+      || (ci->values[0].type != OCONFIG_TYPE_STRING))
+  {
+    WARNING ("network plugin: The `%s' config option needs exactly "
+        "one string argument.", ci->key);
+    return (-1);
+  }
+
+  tmp = strdup (ci->values[0].value.string);
+  if (tmp == NULL)
+    return (-1);
+
+  sfree (*ret_string);
+  *ret_string = tmp;
+
+  return (0);
+} /* }}} int network_config_set_string */
+#endif /* HAVE_LIBGCRYPT */
+
+#if HAVE_LIBGCRYPT
+static int network_config_set_security_level (oconfig_item_t *ci, /* {{{ */
+    int *retval)
+{
+  char *str;
+  if ((ci->values_num != 1)
+      || (ci->values[0].type != OCONFIG_TYPE_STRING))
+  {
+    WARNING ("network plugin: The `SecurityLevel' config option needs exactly "
+        "one string argument.");
+    return (-1);
+  }
+
+  str = ci->values[0].value.string;
+  if (strcasecmp ("Encrypt", str) == 0)
+    *retval = SECURITY_LEVEL_ENCRYPT;
+  else if (strcasecmp ("Sign", str) == 0)
+    *retval = SECURITY_LEVEL_SIGN;
+  else if (strcasecmp ("None", str) == 0)
+    *retval = SECURITY_LEVEL_NONE;
+  else
+  {
+    WARNING ("network plugin: Unknown security level: %s.", str);
+    return (-1);
+  }
+
+  return (0);
+} /* }}} int network_config_set_security_level */
+#endif /* HAVE_LIBGCRYPT */
+
+static int network_config_add_listen (const oconfig_item_t *ci) /* {{{ */
+{
+  sockent_t *se;
+  int status;
+  int i;
+
+  if ((ci->values_num < 1) || (ci->values_num > 2)
+      || (ci->values[0].type != OCONFIG_TYPE_STRING)
+      || ((ci->values_num > 1) && (ci->values[1].type != OCONFIG_TYPE_STRING)))
+  {
+    ERROR ("network plugin: The `%s' config option needs "
+        "one or two string arguments.", ci->key);
+    return (-1);
+  }
+
+  se = malloc (sizeof (*se));
+  if (se == NULL)
+  {
+    ERROR ("network plugin: malloc failed.");
+    return (-1);
+  }
+  sockent_init (se, SOCKENT_TYPE_SERVER);
+
+  se->node = strdup (ci->values[0].value.string);
+  if (ci->values_num >= 2)
+    se->service = strdup (ci->values[1].value.string);
+
+  for (i = 0; i < ci->children_num; i++)
+  {
+    oconfig_item_t *child = ci->children + i;
+
+#if HAVE_LIBGCRYPT
+    if (strcasecmp ("AuthFile", child->key) == 0)
+      network_config_set_string (child, &se->data.server.auth_file);
+    else if (strcasecmp ("SecurityLevel", child->key) == 0)
+      network_config_set_security_level (child,
+          &se->data.server.security_level);
+    else
+#endif /* HAVE_LIBGCRYPT */
+    {
+      WARNING ("network plugin: Option `%s' is not allowed here.",
+          child->key);
+    }
+  }
+
+#if HAVE_LIBGCRYPT
+  if ((se->data.server.security_level > SECURITY_LEVEL_NONE)
+      && (se->data.server.auth_file == NULL))
+  {
+    ERROR ("network plugin: A security level higher than `none' was "
+        "requested, but no AuthFile option was given. Cowardly refusing to "
+        "open this socket!");
+    sockent_destroy (se);
+    return (-1);
+  }
+#endif /* HAVE_LIBGCRYPT */
+
+  status = sockent_open (se);
+  if (status != 0)
+  {
+    ERROR ("network plugin: network_config_add_listen: sockent_open failed.");
+    sockent_destroy (se);
+    return (-1);
+  }
+
+  status = sockent_add (se);
+  if (status != 0)
+  {
+    ERROR ("network plugin: network_config_add_listen: sockent_add failed.");
+    sockent_destroy (se);
+    return (-1);
+  }
+
+  return (0);
+} /* }}} int network_config_add_listen */
+
+static int network_config_add_server (const oconfig_item_t *ci) /* {{{ */
+{
+  sockent_t *se;
+  int status;
+  int i;
+
+  if ((ci->values_num < 1) || (ci->values_num > 2)
+      || (ci->values[0].type != OCONFIG_TYPE_STRING)
+      || ((ci->values_num > 1) && (ci->values[1].type != OCONFIG_TYPE_STRING)))
+  {
+    ERROR ("network plugin: The `%s' config option needs "
+        "one or two string arguments.", ci->key);
+    return (-1);
+  }
+
+  se = malloc (sizeof (*se));
+  if (se == NULL)
+  {
+    ERROR ("network plugin: malloc failed.");
+    return (-1);
+  }
+  sockent_init (se, SOCKENT_TYPE_CLIENT);
+
+  se->node = strdup (ci->values[0].value.string);
+  if (ci->values_num >= 2)
+    se->service = strdup (ci->values[1].value.string);
+
+  for (i = 0; i < ci->children_num; i++)
+  {
+    oconfig_item_t *child = ci->children + i;
+
+#if HAVE_LIBGCRYPT
+    if (strcasecmp ("Username", child->key) == 0)
+      network_config_set_string (child, &se->data.client.username);
+    else if (strcasecmp ("Password", child->key) == 0)
+      network_config_set_string (child, &se->data.client.password);
+    else if (strcasecmp ("SecurityLevel", child->key) == 0)
+      network_config_set_security_level (child,
+          &se->data.client.security_level);
+    else
+#endif /* HAVE_LIBGCRYPT */
+    {
+      WARNING ("network plugin: Option `%s' is not allowed here.",
+          child->key);
+    }
+  }
+
+#if HAVE_LIBGCRYPT
+  if ((se->data.client.security_level > SECURITY_LEVEL_NONE)
+      && ((se->data.client.username == NULL)
+        || (se->data.client.password == NULL)))
+  {
+    ERROR ("network plugin: A security level higher than `none' was "
+        "requested, but no Username or Password option was given. "
+        "Cowardly refusing to open this socket!");
+    sockent_destroy (se);
+    return (-1);
+  }
+#endif /* HAVE_LIBGCRYPT */
+
+  status = sockent_open (se);
+  if (status != 0)
+  {
+    ERROR ("network plugin: network_config_add_server: sockent_open failed.");
+    sockent_destroy (se);
+    return (-1);
+  }
+
+  status = sockent_add (se);
+  if (status != 0)
+  {
+    ERROR ("network plugin: network_config_add_server: sockent_add failed.");
+    sockent_destroy (se);
+    return (-1);
+  }
+
+  return (0);
+} /* }}} int network_config_add_server */
+
+static int network_config_set_cache_flush (const oconfig_item_t *ci) /* {{{ */
+{
+  int tmp;
+  if ((ci->values_num != 1)
+      || (ci->values[0].type != OCONFIG_TYPE_NUMBER))
+  {
+    WARNING ("network plugin: The `CacheFlush' config option needs exactly "
+        "one numeric argument.");
+    return (-1);
+  }
+
+  tmp = (int) ci->values[0].value.number;
+  if (tmp > 0)
+    network_config_ttl = tmp;
+
+  return (0);
+} /* }}} int network_config_set_cache_flush */
+
+static int network_config (oconfig_item_t *ci) /* {{{ */
+{
+  int i;
+
+  for (i = 0; i < ci->children_num; i++)
+  {
+    oconfig_item_t *child = ci->children + i;
+
+    if (strcasecmp ("Listen", child->key) == 0)
+      network_config_add_listen (child);
+    else if (strcasecmp ("Server", child->key) == 0)
+      network_config_add_server (child);
+    else if (strcasecmp ("TimeToLive", child->key) == 0)
+      network_config_set_ttl (child);
+    else if (strcasecmp ("Forward", child->key) == 0)
+      network_config_set_boolean (child, &network_config_forward);
+    else if (strcasecmp ("CacheFlush", child->key) == 0)
+      network_config_set_cache_flush (child);
+    else
+    {
+      WARNING ("network plugin: Option `%s' is not allowed here.",
+          child->key);
+    }
+  }
+
+  return (0);
+} /* }}} int network_config */
+
+static int network_notification (const notification_t *n,
+		user_data_t __attribute__((unused)) *user_data)
 {
   char  buffer[BUFF_SIZE];
   char *buffer_ptr = buffer;
@@ -1707,16 +2878,27 @@ static int network_shutdown (void)
 	listen_loop++;
 
 	/* Kill the listening thread */
-	if (receive_thread_id != (pthread_t) 0)
+	if (receive_thread_running != 0)
 	{
+		INFO ("network plugin: Stopping receive thread.");
 		pthread_kill (receive_thread_id, SIGTERM);
 		pthread_join (receive_thread_id, NULL /* no return value */);
-		receive_thread_id = (pthread_t) 0;
+		memset (&receive_thread_id, 0, sizeof (receive_thread_id));
+		receive_thread_running = 0;
 	}
 
 	/* Shutdown the dispatching thread */
-	if (dispatch_thread_id != (pthread_t) 0)
+	if (dispatch_thread_running != 0)
+	{
+		INFO ("network plugin: Stopping dispatch thread.");
+		pthread_mutex_lock (&receive_list_lock);
 		pthread_cond_broadcast (&receive_list_cond);
+		pthread_mutex_unlock (&receive_list_lock);
+		pthread_join (dispatch_thread_id, /* ret = */ NULL);
+		dispatch_thread_running = 0;
+	}
+
+	sockent_destroy (listen_sockets);
 
 	if (send_buffer_fill > 0)
 		flush_buffer ();
@@ -1757,9 +2939,7 @@ static int network_init (void)
 
 	plugin_register_shutdown ("network", network_shutdown);
 
-	send_buffer_ptr  = send_buffer;
-	send_buffer_fill = 0;
-	memset (&send_buffer_vl, 0, sizeof (send_buffer_vl));
+	network_init_buffer ();
 
 	cache_tree = c_avl_create ((int (*) (const void *, const void *)) strcmp);
 	cache_flush_last = time (NULL);
@@ -1767,14 +2947,21 @@ static int network_init (void)
 	/* setup socket(s) and so on */
 	if (sending_sockets != NULL)
 	{
-		plugin_register_write ("network", network_write);
-		plugin_register_notification ("network", network_notification);
+		plugin_register_write ("network", network_write,
+				/* user_data = */ NULL);
+		plugin_register_notification ("network", network_notification,
+				/* user_data = */ NULL);
 	}
 
-	if ((listen_sockets_num != 0) && (receive_thread_id == 0))
+	/* If no threads need to be started, return here. */
+	if ((listen_sockets_num == 0)
+			|| ((dispatch_thread_running != 0)
+				&& (receive_thread_running != 0)))
+		return (0);
+
+	if (dispatch_thread_running == 0)
 	{
 		int status;
-
 		status = pthread_create (&dispatch_thread_id,
 				NULL /* no attributes */,
 				dispatch_thread,
@@ -1786,7 +2973,15 @@ static int network_init (void)
 					sstrerror (errno, errbuf,
 						sizeof (errbuf)));
 		}
+		else
+		{
+			dispatch_thread_running = 1;
+		}
+	}
 
+	if (receive_thread_running == 0)
+	{
+		int status;
 		status = pthread_create (&receive_thread_id,
 				NULL /* no attributes */,
 				receive_thread,
@@ -1798,7 +2993,12 @@ static int network_init (void)
 					sstrerror (errno, errbuf,
 						sizeof (errbuf)));
 		}
+		else
+		{
+			receive_thread_running = 1;
+		}
 	}
+
 	return (0);
 } /* int network_init */
 
@@ -1810,7 +3010,8 @@ static int network_init (void)
  * there, good. If not, well, then there is nothing to flush.. -octo
  */
 static int network_flush (int timeout,
-		const char __attribute__((unused)) *identifier)
+		const char __attribute__((unused)) *identifier,
+		user_data_t __attribute__((unused)) *user_data)
 {
 	pthread_mutex_lock (&send_buffer_lock);
 
@@ -1827,8 +3028,10 @@ static int network_flush (int timeout,
 
 void module_register (void)
 {
-	plugin_register_config ("network", network_config,
-			config_keys, config_keys_num);
+	plugin_register_complex_config ("network", network_config);
 	plugin_register_init   ("network", network_init);
-	plugin_register_flush   ("network", network_flush);
+	plugin_register_flush   ("network", network_flush,
+			/* user_data = */ NULL);
 } /* void module_register */
+
+/* vim: set fdm=marker : */
